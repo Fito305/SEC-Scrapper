@@ -1,0 +1,13 @@
+[package]
+name = "valuation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+accounting_domains = { path = "../accounting_domains" }
+filing_models = { path = "../filing_models" }
+normalization = { path = "../normalization" }
+thiserror.workspace = true
+time.workspace = true

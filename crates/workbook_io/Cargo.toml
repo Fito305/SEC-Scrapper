@@ -1,0 +1,16 @@
+[package]
+name = "workbook_io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+accounting_domains = { path = "../accounting_domains" }
+filing_models = { path = "../filing_models" }
+normalization = { path = "../normalization" }
+valuation = { path = "../valuation" }
+calamine.workspace = true
+rust_xlsxwriter.workspace = true
+thiserror.workspace = true
+time.workspace = true

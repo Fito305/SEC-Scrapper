@@ -1,0 +1,14 @@
+[package]
+name = "xbrl_extractor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+accounting_domains = { path = "../accounting_domains" }
+filing_models = { path = "../filing_models" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true

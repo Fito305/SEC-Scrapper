@@ -1,0 +1,13 @@
+[package]
+name = "normalization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+accounting_domains = { path = "../accounting_domains" }
+filing_models = { path = "../filing_models" }
+html_extractor = { path = "../html_extractor" }
+time.workspace = true
+xbrl_extractor = { path = "../xbrl_extractor" }

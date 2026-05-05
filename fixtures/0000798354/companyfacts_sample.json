@@ -1,0 +1,76 @@
+{
+  "cik": "0000798354",
+  "entityName": "Fixture Company",
+  "facts": {
+    "us-gaap": {
+      "CashAndCashEquivalentsAtCarryingValue": {
+        "label": "Cash and cash equivalents",
+        "description": "Cash",
+        "units": {
+          "USD": [
+            {
+              "end": "2024-12-31",
+              "val": 1250000,
+              "accn": "0000798354-25-000010",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-01"
+            }
+          ]
+        }
+      },
+      "RevenueFromContractWithCustomerExcludingAssessedTax": {
+        "label": "Revenue",
+        "units": {
+          "USD": [
+            {
+              "start": "2024-01-01",
+              "end": "2024-12-31",
+              "val": 9800000,
+              "accn": "0000798354-25-000010",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-01"
+            }
+          ]
+        }
+      },
+      "NetIncomeLoss": {
+        "label": "Net Income",
+        "units": {
+          "USD": [
+            {
+              "start": "2024-01-01",
+              "end": "2024-12-31",
+              "val": 1000000,
+              "accn": "0000798354-25-000010",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-01"
+            }
+          ]
+        }
+      },
+      "ShareBasedCompensation": {
+        "label": "Share-based compensation",
+        "units": {
+          "USD": [
+            {
+              "start": "2024-01-01",
+              "end": "2024-12-31",
+              "val": 75000,
+              "accn": "0000798354-25-000010",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-01"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,344 @@
+Primary Data Structures
+=======================
+
+Purpose
+-------
+This file documents the main data structures used throughout the program, what each one is for,
+and how they interact as data moves from SEC retrieval to workbook export.
+
+High-Level Flow
+---------------
+1. `cli` receives the ticker or CIK and starts the workflow.
+2. `filing_discovery` produces the filing set to work on.
+3. `xbrl_extractor` and `html_extractor` produce extracted values.
+4. `normalization` reconciles extracted values into analyst-facing primary metrics plus provenance.
+5. `valuation` reads normalized metrics and emits placeholder outputs.
+6. `workbook_io` turns the normalized data and valuation outputs into workbook sheets.
+
+
+Core Shared Models
+------------------
+
+File:
+- `crates/filing_models/src/lib.rs`
+
+1. `CompanyIdentity`
+- Use case:
+  identifies the company being analyzed.
+- Primary fields:
+  issuer name, primary id, ticker, CIK-style identity information.
+- Used by:
+  `cli`, `filing_discovery`, `app_workflow`, `workbook_io`.
+- Interaction:
+  created early in discovery, then carried into workbook export.
+
+2. `FilingMetadata`
+- Use case:
+  describes one SEC filing selected for extraction.
+- Primary fields:
+  accession number, form type, filing date, report period end, filing URLs.
+- Used by:
+  `filing_discovery`, `sec_client`, `html_extractor`, `app_workflow`, `workbook_io`.
+- Interaction:
+  this is the bridge between discovery and per-filing extraction.
+
+3. `ReportingPeriod`
+- Use case:
+  describes the accounting period a value belongs to.
+- Primary fields:
+  `context`, `fiscal_period`, `label`.
+- Used by:
+  `xbrl_extractor`, `html_extractor`, `normalization`, `valuation`, `workbook_io`.
+- Interaction:
+  this is one of the most important structures in the whole program because workbook columns and
+  valuation grouping depend on it.
+
+4. `PeriodContext`
+- Use case:
+  distinguishes instant values from duration values.
+- Variants:
+  `Instant { as_of }`
+  `Duration { start, end }`
+- Used by:
+  all numeric extraction and normalization paths.
+- Interaction:
+  determines whether a value belongs to a balance-sheet style date or an income/cash-flow style span.
+
+5. `NumericValue`
+- Use case:
+  the main container for extracted numeric financial data.
+- Primary fields:
+  amount, unit, scale, sign convention, label, reporting period, provenance.
+- Used by:
+  `xbrl_extractor`, `html_extractor`, `normalization`, `valuation`, `workbook_io`.
+- Interaction:
+  this is the main numeric payload object through the program.
+
+6. `TextBlock`
+- Use case:
+  stores extracted narrative content such as footnotes or MD&A sections.
+- Used by:
+  `html_extractor`, `normalization`, `workbook_io`.
+- Interaction:
+  this is the narrative counterpart to `NumericValue`.
+
+7. `Provenance`
+- Use case:
+  explains where a value came from.
+- Primary fields:
+  accession number, filing URL, form type, source type, source method, source location, xbrl tag,
+  reporting period, unit, scale.
+- Used by:
+  every extracted or normalized numeric value, valuation input traceability, workbook review sheets.
+- Interaction:
+  this is what makes review, auditability, and analyst verification possible.
+
+8. `SourceLocator`
+- Use case:
+  stores fine-grained origin details inside a filing.
+- Primary fields:
+  section name, table name, row label, cell reference, segment name.
+- Used by:
+  `html_extractor`, `xbrl_extractor`, `normalization`, `workbook_io`.
+- Interaction:
+  especially important for:
+  - duplicate review
+  - segment rows
+  - note-table traceability
+
+
+Extraction Models
+-----------------
+
+Files:
+- `crates/xbrl_extractor/src/lib.rs`
+- `crates/html_extractor/src/lib.rs`
+
+9. `ExtractedMetricValue`
+- Use case:
+  one XBRL-extracted metric candidate before normalization.
+- Primary fields:
+  metric id, metric name, domain, subdomain, xbrl tag, numeric value.
+- Used by:
+  `xbrl_extractor`, `normalization`.
+- Interaction:
+  this is the XBRL-side candidate structure passed into normalization.
+
+10. `ExtractedHtmlMetricValue`
+- Use case:
+  one HTML fallback metric candidate before normalization.
+- Primary fields:
+  metric id, metric name, domain, subdomain, numeric value.
+- Used by:
+  `html_extractor`, `normalization`.
+- Interaction:
+  this is the HTML-side candidate structure passed into normalization.
+
+11. `HtmlExtractionResult`
+- Use case:
+  bundles numeric fallback values plus narrative sections from one extraction pass.
+- Primary fields:
+  `numeric_fallbacks`, `narrative_sections`.
+- Used by:
+  `html_extractor`, `app_workflow`, `normalization`.
+- Interaction:
+  this is the main result object coming out of HTML extraction.
+
+
+Normalization Models
+--------------------
+
+File:
+- `crates/normalization/src/lib.rs`
+
+12. `NormalizationResult`
+- Use case:
+  the main analyst-facing structured output before valuation and workbook export.
+- Primary fields:
+  `numeric_metrics`, `narrative_metrics`, `issues`.
+- Used by:
+  `app_workflow`, `valuation`, `workbook_io`.
+- Interaction:
+  this is the central handoff object for the later program stages.
+
+13. `NormalizedNumericMetric`
+- Use case:
+  one normalized numeric metric for one metric-period group.
+- Primary fields:
+  metric id, period key, domain, metric name, subdomain, primary value, source values.
+- Used by:
+  `valuation`, `workbook_io`, analyst review logic.
+- Interaction:
+  this is the final primary numeric representation used by formulas and workbook domain sheets.
+
+14. `NormalizedNarrativeMetric`
+- Use case:
+  normalized narrative output for one domain metric.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  narrative metrics stay separated from numeric metrics but follow the same domain-first design.
+
+15. `NormalizedSourceValue`
+- Use case:
+  preserves every source value that participated in normalization, not just the selected primary.
+- Primary fields:
+  value, source, `selected_as_primary`, review note.
+- Used by:
+  `workbook_io` provenance and duplicate review sheets.
+- Interaction:
+  this is the key structure for keeping alternates visible without losing the chosen primary value.
+
+16. `NormalizationIssue`
+- Use case:
+  warning or error emitted during reconciliation and analyst review.
+- Primary fields:
+  severity, code, metric id, period key, segment name, message.
+- Used by:
+  `app_workflow`, `workbook_io`.
+- Interaction:
+  these become the `review_warnings` workbook sheet.
+
+
+Valuation Models
+----------------
+
+File:
+- `crates/valuation/src/lib.rs`
+
+17. `ValuationEngine`
+- Use case:
+  orchestrates placeholder valuation output generation.
+- Used by:
+  `app_workflow`, `cli`.
+- Interaction:
+  reads `NormalizationResult`, writes `ValuationOutput`.
+
+18. `ValuationOutput`
+- Use case:
+  one valuation metric output row.
+- Primary fields:
+  metric id, metric name, domain, numeric value, inputs, comment.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  this becomes workbook valuation rows and formula input traceability.
+
+19. `ValuationInputBreakdown`
+- Use case:
+  documents which normalized metric fed a valuation output.
+- Used by:
+  `valuation`, `workbook_io`.
+- Interaction:
+  this is the traceability bridge between normalized data and formula results.
+
+
+Workbook Export Models
+----------------------
+
+File:
+- `crates/workbook_io/src/lib.rs`
+
+20. `WorkbookExportModel`
+- Use case:
+  top-level workbook payload.
+- Primary fields:
+  company, filing index, period columns, sheets, provenance records, duplicate candidate records,
+  review issues, coverage records, formula input records.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  this is the final in-memory export package before `.xlsx` writing.
+
+21. `WorkbookMetricRow`
+- Use case:
+  one row in a workbook domain sheet.
+- Primary fields:
+  domain, metric id, metric label, subdomain, values by period.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  for `segment_data`, one row is `segment_name + metric`.
+
+22. `WorkbookProvenanceRecord`
+- Use case:
+  row-level review trace for all source values used in normalization.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  backs the `provenance` sheet.
+
+23. `WorkbookDuplicateCandidateRecord`
+- Use case:
+  row-level review trace for non-primary duplicate values.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  backs the `duplicate_candidates` sheet.
+
+24. `WorkbookReviewIssue`
+- Use case:
+  workbook export form of a normalization/review issue.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  backs the `review_warnings` sheet.
+
+25. `WorkbookCoverageRecord`
+- Use case:
+  coverage/missing-status summary per registry metric.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  powers `coverage_summary` and `missing_metrics`.
+
+26. `WorkbookFormulaInputRecord`
+- Use case:
+  traces each formula output back to its input metrics.
+- Used by:
+  `workbook_io`.
+- Interaction:
+  this is important for later formula replacement and analyst trust.
+
+
+How These Structures Interact
+-----------------------------
+
+1. Discovery stage
+- `CompanyIdentity` + `FilingMetadata`
+
+2. Extraction stage
+- `ExtractedMetricValue`
+- `ExtractedHtmlMetricValue`
+- `HtmlExtractionResult`
+- each candidate contains a `NumericValue`
+- each `NumericValue` contains `ReportingPeriod` + `Provenance`
+
+3. Normalization stage
+- extraction candidates become `NormalizedNumericMetric`
+- alternates remain in `NormalizedSourceValue`
+- review concerns become `NormalizationIssue`
+- all of this is wrapped in `NormalizationResult`
+
+4. Valuation stage
+- `NormalizationResult` feeds `ValuationEngine`
+- `ValuationEngine` emits `ValuationOutput`
+- `ValuationInputBreakdown` preserves the link back to normalized inputs
+
+5. Workbook stage
+- `NormalizationResult` + `ValuationOutput` become `WorkbookExportModel`
+- `WorkbookMetricRow` builds the domain sheets
+- `WorkbookProvenanceRecord`, `WorkbookDuplicateCandidateRecord`, and `WorkbookReviewIssue`
+  build the analyst review sheets
+
+
+Maintenance Notes
+-----------------
+- If you change how periods are interpreted, start with:
+  `ReportingPeriod`, `PeriodContext`, and the normalization period-key helpers.
+- If you change where values come from, start with:
+  `Provenance` and `SourceLocator`.
+- If you replace formulas, start with:
+  `ValuationEngine`, `ValuationOutput`, and `ValuationInputBreakdown`.
+- If you add new workbook review views, start with:
+  `WorkbookExportModel` and the workbook record structs in `crates/workbook_io/src/lib.rs`.

@@ -1,0 +1,18 @@
+/target/
+
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Local environment / secrets
+.env
+.env.*
+
+# Python cache from local inspection helpers
+__pycache__/
+*.pyc
+
+# Local ad-hoc notes
+.idea/
+.vscode/

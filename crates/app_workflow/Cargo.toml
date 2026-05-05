@@ -1,0 +1,23 @@
+[package]
+name = "app_workflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+accounting_domains = { path = "../accounting_domains" }
+app_core = { path = "../app_core" }
+filing_discovery = { path = "../filing_discovery" }
+filing_models = { path = "../filing_models" }
+html_extractor = { path = "../html_extractor" }
+normalization = { path = "../normalization" }
+sec_client = { path = "../sec_client" }
+thiserror.workspace = true
+valuation = { path = "../valuation" }
+workbook_io = { path = "../workbook_io" }
+xbrl_extractor = { path = "../xbrl_extractor" }
+
+[dev-dependencies]
+time.workspace = true
+tokio.workspace = true

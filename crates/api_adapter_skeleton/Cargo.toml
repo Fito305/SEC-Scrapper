@@ -1,0 +1,10 @@
+[package]
+name = "api_adapter_skeleton"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+filing_models = { path = "../filing_models" }
+serde.workspace = true
