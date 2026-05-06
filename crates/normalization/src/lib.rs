@@ -573,6 +573,10 @@ fn record_duplicate_issue(
         return;
     }
 
+    if suppress_history_duplicate_issue(&candidates.metric_id, values) {
+        return;
+    }
+
     let source_name = match source {
         NormalizationSource::XbrlPrimary => "XBRL",
         NormalizationSource::HtmlFallback => "HTML",
@@ -600,6 +604,31 @@ fn duplicate_values_are_identical(values: &[NumericValue]) -> bool {
             && first.scale == value.scale
             && first.reporting_period == value.reporting_period
     })
+}
+
+fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+
+    let supports_history_suppression = metric_id.starts_with("segment_data.")
+        || metric_id == "debt_and_credit.notes_and_bonds";
+    if !supports_history_suppression {
+        return false;
+    }
+
+    let mut ranks = values
+        .iter()
+        .map(|value| history_rank(metric_id, value))
+        .collect::<Vec<_>>();
+    ranks.sort();
+
+    let Some(best_rank) = ranks.first() else {
+        return false;
+    };
+
+    let best_rank_count = ranks.iter().filter(|rank| *rank == best_rank).count();
+    best_rank_count == 1
 }
 
 fn collapse_same_accession_duplicates(domain: DomainName, values: &mut Vec<NumericValue>) {
@@ -631,9 +660,7 @@ fn rank_source_values(metric_id: &str, values: &mut [NumericValue]) {
     values.sort_by(|left, right| {
         source_rank(metric_id, left)
             .cmp(&source_rank(metric_id, right))
-            .then_with(|| {
-                segment_history_rank(metric_id, left).cmp(&segment_history_rank(metric_id, right))
-            })
+            .then_with(|| history_rank(metric_id, left).cmp(&history_rank(metric_id, right)))
             .then_with(|| {
                 left.provenance
                     .filing_label
@@ -670,6 +697,24 @@ fn segment_history_rank(metric_id: &str, value: &NumericValue) -> (i32, String) 
     let filing_year =
         accession_filing_year(&value.provenance.accession_number).unwrap_or(reporting_year);
     ((filing_year - reporting_year).abs(), value.provenance.accession_number.clone())
+}
+
+fn history_rank(metric_id: &str, value: &NumericValue) -> (i32, String) {
+    if metric_id.starts_with("segment_data.") {
+        return segment_history_rank(metric_id, value);
+    }
+
+    if metric_id == "debt_and_credit.notes_and_bonds" {
+        let reporting_year = match value.reporting_period.context {
+            filing_models::PeriodContext::Instant { as_of } => as_of.year(),
+            filing_models::PeriodContext::Duration { end, .. } => end.year(),
+        };
+        let filing_year =
+            accession_filing_year(&value.provenance.accession_number).unwrap_or(reporting_year);
+        return ((filing_year - reporting_year).abs(), value.provenance.accession_number.clone());
+    }
+
+    (0, value.provenance.accession_number.clone())
 }
 
 fn accession_filing_year(accession_number: &str) -> Option<i32> {
@@ -791,6 +836,10 @@ fn html_source_rank(metric_id: &str, value: &NumericValue) -> u8 {
         return debt_interest_rate_rank(&label);
     }
 
+    if metric_id == "balance_sheet.long_term_debt" {
+        return long_term_debt_rank(value);
+    }
+
     if label.starts_with("total ") || label.starts_with("net cash ") {
         1
     } else if metric_id == "income_statement.cost_of_goods_sold"
@@ -820,9 +869,53 @@ fn debt_interest_rate_rank(label: &str) -> u8 {
     }
 }
 
+fn long_term_debt_rank(value: &NumericValue) -> u8 {
+    if context_contains(value, "selected consolidated balance sheets")
+        || context_contains(value, "balance sheets data")
+        || context_contains(value, "balance sheet")
+    {
+        1
+    } else if context_contains(value, "assets and liabilities measured at fair value")
+        || context_contains(value, "fair value hierarchy")
+        || context_contains(value, "derivative netting adjustments")
+    {
+        5
+    } else {
+        3
+    }
+}
+
 fn prune_context_mismatches(metric_id: &str, values: &mut Vec<NumericValue>) {
     if metric_id == "income_statement.cost_of_goods_sold" {
         values.retain(|value| !context_contains(value, "percent of net sales"));
+    } else if metric_id == "balance_sheet.long_term_debt" {
+        let has_non_fair_value_candidate = values.iter().any(|value| {
+            !context_contains(value, "assets and liabilities measured at fair value")
+                && !context_contains(value, "fair value hierarchy")
+                && !context_contains(value, "derivative netting adjustments")
+        });
+
+        if has_non_fair_value_candidate {
+            values.retain(|value| {
+                !context_contains(value, "assets and liabilities measured at fair value")
+                    && !context_contains(value, "fair value hierarchy")
+                    && !context_contains(value, "derivative netting adjustments")
+            });
+        }
+    } else if metric_id == "debt_and_credit.interest_rate" {
+        let has_non_fair_value_candidate = values.iter().any(|value| {
+            !context_contains(value, "assets and liabilities measured at fair value")
+                && !context_contains(value, "fair value hierarchy")
+                && !context_contains(value, "derivative netting adjustments")
+        });
+
+        if has_non_fair_value_candidate {
+            values.retain(|value| {
+                !context_contains(value, "assets and liabilities measured at fair value")
+                    && !context_contains(value, "fair value hierarchy")
+                    && !context_contains(value, "derivative netting adjustments")
+            });
+        }
     }
 }
 
@@ -1623,6 +1716,118 @@ mod tests {
     }
 
     #[test]
+    fn long_term_debt_prefers_balance_sheet_context_over_fair_value_context() {
+        let normalizer = Normalizer::new();
+
+        let mut balance_sheet_value = sample_numeric_value(SourceType::Html, 292224.0);
+        balance_sheet_value.label = Some("Long-term debt".to_string());
+        balance_sheet_value.provenance.filing_label =
+            Some("Selected Consolidated balance sheets data".to_string());
+        balance_sheet_value.provenance.source_location.section_name =
+            Some("Selected Consolidated balance sheets data".to_string());
+        balance_sheet_value.provenance.source_location.table_name =
+            Some("Long-term debt".to_string());
+        balance_sheet_value.provenance.source_location.row_label =
+            Some("Long-term debt".to_string());
+
+        let mut fair_value_value = sample_numeric_value(SourceType::Html, 31394.0);
+        fair_value_value.label = Some("Long-term debt".to_string());
+        fair_value_value.provenance.filing_label =
+            Some("Assets and liabilities measured at fair value on a recurring basis".to_string());
+        fair_value_value.provenance.source_location.section_name =
+            Some("Assets and liabilities measured at fair value on a recurring basis".to_string());
+        fair_value_value.provenance.source_location.table_name =
+            Some("Long-term debt".to_string());
+        fair_value_value.provenance.source_location.row_label =
+            Some("Long-term debt".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: fair_value_value,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: balance_sheet_value,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 292224.0);
+        assert_eq!(
+            normalized.numeric_metrics[0]
+                .value
+                .provenance
+                .source_location
+                .section_name
+                .as_deref(),
+            Some("Selected Consolidated balance sheets data")
+        );
+    }
+
+    #[test]
+    fn later_financial_funding_repeats_stay_in_review_without_main_duplicate_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut filing_2023 = sample_numeric_value_for_year(SourceType::Html, 21483.0, 2023);
+        filing_2023.label = Some("Senior notes".to_string());
+        filing_2023.provenance.accession_number = "000001961724000225".to_string();
+        filing_2023.provenance.form_type = FilingForm::Form10K;
+        filing_2023.provenance.filing_label =
+            Some("Long-term unsecured funding Year ended December 31,".to_string());
+        filing_2023.provenance.source_location.section_name =
+            Some("Long-term unsecured funding Year ended December 31,".to_string());
+        filing_2023.provenance.source_location.table_name = Some("Senior notes".to_string());
+        filing_2023.provenance.source_location.row_label = Some("Senior notes".to_string());
+
+        let mut filing_2024_q1 = sample_numeric_value_for_year(SourceType::Html, 21483.0, 2023);
+        filing_2024_q1.label = Some("Senior notes".to_string());
+        filing_2024_q1.provenance.accession_number = "000001961724000301".to_string();
+        filing_2024_q1.provenance.form_type = FilingForm::Form10Q;
+        filing_2024_q1.provenance.filing_label =
+            Some("Long-term unsecured funding Year ended December 31,".to_string());
+        filing_2024_q1.provenance.source_location.section_name =
+            Some("Long-term unsecured funding Year ended December 31,".to_string());
+        filing_2024_q1.provenance.source_location.table_name = Some("Senior notes".to_string());
+        filing_2024_q1.provenance.source_location.row_label = Some("Senior notes".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.notes_and_bonds"),
+                    metric_name: "Notes and Bonds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding".to_string()),
+                    numeric_value: filing_2024_q1,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.notes_and_bonds"),
+                    metric_name: "Notes and Bonds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding".to_string()),
+                    numeric_value: filing_2023,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
+    }
+
+    #[test]
     fn derivative_gain_loss_prefers_nearest_filing_window_and_drops_later_history_repeats() {
         let normalizer = Normalizer::new();
 
@@ -2093,6 +2298,71 @@ mod tests {
 
         assert_eq!(metric.value.amount, 5089.0);
         assert_eq!(metric.value.provenance.accession_number, "0001558370-20-000581");
+    }
+
+    #[test]
+    fn later_segment_history_repeats_stay_in_review_without_main_duplicate_warning() {
+        let normalizer = Normalizer::new();
+        let historical_period = sample_duration_reporting_period(2019, 2019);
+        let mut filing_2021 = sample_segment_value(
+            SourceType::Html,
+            5151.0,
+            "Consumer Segment",
+            "2021 10-K",
+            "0001558370-21-000737",
+        );
+        set_reporting_period(&mut filing_2021, historical_period.clone());
+        let mut filing_2022 = sample_segment_value(
+            SourceType::Html,
+            5129.0,
+            "Consumer Segment",
+            "2022 10-K",
+            "0000066740-22-000010",
+        );
+        set_reporting_period(&mut filing_2022, historical_period.clone());
+        let mut filing_2020 = sample_segment_value(
+            SourceType::Html,
+            5089.0,
+            "Consumer Segment",
+            "2020 10-K",
+            "0001558370-20-000581",
+        );
+        set_reporting_period(&mut filing_2020, historical_period);
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: filing_2021,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: filing_2022,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: filing_2020,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 3);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "later comparative segment history should stay in provenance without cluttering the main review sheet"
+        );
     }
 
     #[test]

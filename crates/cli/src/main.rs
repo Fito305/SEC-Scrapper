@@ -147,6 +147,29 @@ async fn fetch_export(
     println!("Normalized metrics exported: {}", summary.normalized_metric_count);
     println!("Valuation outputs exported: {}", summary.valuation_output_count);
     println!("Review issues exported: {}", summary.review_issue_count);
+    println!("Stage timings (ms):");
+    println!("  resolve_cik: {}", summary.stage_timings_ms.resolve_cik_ms);
+    println!("  discover_filings: {}", summary.stage_timings_ms.discover_filings_ms);
+    println!("  fetch_company_facts: {}", summary.stage_timings_ms.fetch_company_facts_ms);
+    println!("  extract_xbrl: {}", summary.stage_timings_ms.extract_xbrl_ms);
+    println!("  extract_html: {}", summary.stage_timings_ms.extract_html_ms);
+    println!("  normalize: {}", summary.stage_timings_ms.normalize_ms);
+    println!("  valuation: {}", summary.stage_timings_ms.valuation_ms);
+    println!("  workbook_export: {}", summary.stage_timings_ms.workbook_export_ms);
+    println!("  total: {}", summary.stage_timings_ms.total_ms);
+    if !summary.slowest_html_filings.is_empty() {
+        println!("Slowest HTML filings (ms):");
+        for timing in &summary.slowest_html_filings {
+            println!(
+                "  {} {} download={} extract={} total={}",
+                timing.accession_number,
+                timing.form_type,
+                timing.download_ms,
+                timing.extract_ms,
+                timing.total_ms
+            );
+        }
+    }
 
     Ok(())
 }

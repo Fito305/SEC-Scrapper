@@ -14,10 +14,10 @@ html_extractor = { path = "../html_extractor" }
 normalization = { path = "../normalization" }
 sec_client = { path = "../sec_client" }
 thiserror.workspace = true
+tokio.workspace = true
 valuation = { path = "../valuation" }
 workbook_io = { path = "../workbook_io" }
 xbrl_extractor = { path = "../xbrl_extractor" }
 
 [dev-dependencies]
 time.workspace = true
-tokio.workspace = true

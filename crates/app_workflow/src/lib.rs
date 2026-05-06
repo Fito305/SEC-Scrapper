@@ -15,11 +15,14 @@ use sec_client::{
     CompanyTickersResponse, RecentFilingLists, SecClient, SecClientError, SubmissionsResponse,
     ticker_lookup_records_from_response,
 };
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, path::Path, time::Instant};
 use thiserror::Error;
+use tokio::task::JoinSet;
 use valuation::{ValuationEngine, ValuationOutput};
 use workbook_io::{WorkbookExporter, WorkbookIoError};
 use xbrl_extractor::{CompanyFactsResponse, XbrlExtractionError, XbrlExtractor};
+
+const HTML_EXTRACTION_CONCURRENCY: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum WorkflowError {
@@ -53,6 +56,38 @@ pub struct FetchExportSummary {
     pub normalized_metric_count: usize,
     pub valuation_output_count: usize,
     pub review_issue_count: usize,
+    pub stage_timings_ms: FetchExportStageTimings,
+    pub slowest_html_filings: Vec<HtmlFilingTiming>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FetchExportStageTimings {
+    pub resolve_cik_ms: u128,
+    pub discover_filings_ms: u128,
+    pub fetch_company_facts_ms: u128,
+    pub extract_xbrl_ms: u128,
+    pub extract_html_ms: u128,
+    pub normalize_ms: u128,
+    pub valuation_ms: u128,
+    pub workbook_export_ms: u128,
+    pub total_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlFilingTiming {
+    pub accession_number: String,
+    pub form_type: String,
+    pub download_ms: u128,
+    pub extract_ms: u128,
+    pub total_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HtmlFilingBatch {
+    numeric_fallbacks: Vec<html_extractor::ExtractedHtmlMetricValue>,
+    narrative_sections: Vec<html_extractor::ExtractedNarrativeSection>,
+    issues: Vec<NormalizationIssue>,
+    timing: Option<HtmlFilingTiming>,
 }
 
 pub fn export_fixture_dataset_to_path(
@@ -110,6 +145,8 @@ pub fn export_fixture_dataset_to_path(
         normalized_metric_count: normalized.numeric_metrics.len(),
         valuation_output_count: valuation_outputs.len(),
         review_issue_count,
+        stage_timings_ms: FetchExportStageTimings::default(),
+        slowest_html_filings: Vec::new(),
     })
 }
 
@@ -147,23 +184,48 @@ impl SecFetchExportWorkflow {
         request: FetchExportRequest,
         output_path: impl AsRef<Path>,
     ) -> Result<FetchExportSummary, WorkflowError> {
+        let total_started = Instant::now();
+
+        let started = Instant::now();
         let cik = self.resolve_cik(&request.company_id).await?;
+        let resolve_cik_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
         let discovery_result =
             self.discover_filings(&cik, request.company_id.clone(), request.years).await?;
+        let discover_filings_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
         let company_facts = self.fetch_company_facts(&cik).await?;
+        let fetch_company_facts_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
         let xbrl_metrics =
             self.xbrl_extractor.extract_for_filings(&company_facts, &discovery_result.filings)?;
-        let (mut html_result, html_issues) = if request.include_html_fallback {
+        let extract_xbrl_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
+        let (mut html_result, html_issues, slowest_html_filings) = if request.include_html_fallback
+        {
             self.extract_html_for_filings(&discovery_result.filings).await
         } else {
-            (HtmlExtractionResult::default(), Vec::new())
+            (HtmlExtractionResult::default(), Vec::new(), Vec::new())
         };
+        let extract_html_ms = started.elapsed().as_millis();
+
         keep_html_only_where_xbrl_is_missing(&xbrl_metrics, &mut html_result);
+
+        let started = Instant::now();
         let mut normalized = self.normalizer.normalize(&xbrl_metrics, &html_result);
         normalized.issues.extend(html_issues);
+        let normalize_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
         let (valuation_outputs, valuation_issues) = self.compute_valuation_outputs(&normalized);
         normalized.issues.extend(valuation_issues);
         append_analyst_review_issues(&mut normalized);
+        let valuation_ms = started.elapsed().as_millis();
+
         let review_issue_count = normalized.issues.len();
         let workbook = self.workbook_exporter.build_model_with_filings(
             discovery_result.company.clone(),
@@ -172,7 +234,21 @@ impl SecFetchExportWorkflow {
             &valuation_outputs,
         );
 
+        let started = Instant::now();
         self.workbook_exporter.export_to_path(&workbook, output_path)?;
+        let workbook_export_ms = started.elapsed().as_millis();
+
+        let stage_timings_ms = FetchExportStageTimings {
+            resolve_cik_ms,
+            discover_filings_ms,
+            fetch_company_facts_ms,
+            extract_xbrl_ms,
+            extract_html_ms,
+            normalize_ms,
+            valuation_ms,
+            workbook_export_ms,
+            total_ms: total_started.elapsed().as_millis(),
+        };
 
         Ok(FetchExportSummary {
             company: discovery_result.company,
@@ -184,6 +260,8 @@ impl SecFetchExportWorkflow {
             normalized_metric_count: normalized.numeric_metrics.len(),
             valuation_output_count: valuation_outputs.len(),
             review_issue_count,
+            stage_timings_ms,
+            slowest_html_filings,
         })
     }
 
@@ -250,46 +328,37 @@ impl SecFetchExportWorkflow {
     async fn extract_html_for_filings(
         &self,
         filings: &[FilingMetadata],
-    ) -> (HtmlExtractionResult, Vec<NormalizationIssue>) {
+    ) -> (HtmlExtractionResult, Vec<NormalizationIssue>, Vec<HtmlFilingTiming>) {
         let mut combined = HtmlExtractionResult::default();
         let mut issues = Vec::new();
+        let mut timings = Vec::new();
+        let mut join_set = JoinSet::new();
 
-        for filing in filings {
-            let Some(primary_document_url) = &filing.filing_urls.primary_document else {
+        for filing in filings.iter().cloned() {
+            if filing.filing_urls.primary_document.is_none() {
                 continue;
-            };
-            let request = sec_client::SecRequest {
-                endpoint_class: sec_client::EndpointClass::FilingDocument,
-                source_method: filing_models::FilingSourceMethod::FilingHtml,
-                url: primary_document_url.clone(),
-                description: format!("primary filing document {}", filing.accession_number),
-            };
-            let html = match self.sec_client.get_text(&request).await {
-                Ok(html) => html,
-                Err(error) => {
-                    issues.push(html_warning_issue(
-                        filing,
-                        format!("HTML fallback download failed and was skipped: {error}"),
-                    ));
-                    continue;
-                }
-            };
-            let extracted = match self.html_extractor.extract(&html, filing) {
-                Ok(extracted) => extracted,
-                Err(error) => {
-                    issues.push(html_warning_issue(
-                        filing,
-                        format!("HTML fallback extraction failed and was skipped: {error}"),
-                    ));
-                    continue;
-                }
-            };
+            }
 
-            combined.numeric_fallbacks.extend(extracted.numeric_fallbacks);
-            combined.narrative_sections.extend(extracted.narrative_sections);
+            let sec_client = self.sec_client.clone();
+            let html_extractor = self.html_extractor.clone();
+            join_set.spawn(async move {
+                extract_single_html_filing(sec_client, html_extractor, filing).await
+            });
+
+            if join_set.len() >= HTML_EXTRACTION_CONCURRENCY {
+                if let Some(batch) = join_set.join_next().await {
+                    merge_html_filing_batch(batch.expect("html extraction task should not panic"), &mut combined, &mut issues, &mut timings);
+                }
+            }
         }
 
-        (combined, issues)
+        while let Some(batch) = join_set.join_next().await {
+            merge_html_filing_batch(batch.expect("html extraction task should not panic"), &mut combined, &mut issues, &mut timings);
+        }
+
+        timings = top_slowest_html_timings(timings);
+
+        (combined, issues, timings)
     }
 
     fn compute_valuation_outputs(
@@ -466,6 +535,95 @@ fn html_warning_issue(filing: &FilingMetadata, message: String) -> Normalization
         segment_name: None,
         message: format!("{} ({})", message, filing.accession_number),
     }
+}
+
+async fn extract_single_html_filing(
+    sec_client: SecClient,
+    html_extractor: HtmlExtractor,
+    filing: FilingMetadata,
+) -> HtmlFilingBatch {
+    let Some(primary_document_url) = &filing.filing_urls.primary_document else {
+        return HtmlFilingBatch {
+            numeric_fallbacks: Vec::new(),
+            narrative_sections: Vec::new(),
+            issues: Vec::new(),
+            timing: None,
+        };
+    };
+
+    let request = sec_client::SecRequest {
+        endpoint_class: sec_client::EndpointClass::FilingDocument,
+        source_method: filing_models::FilingSourceMethod::FilingHtml,
+        url: primary_document_url.clone(),
+        description: format!("primary filing document {}", filing.accession_number),
+    };
+
+    let started = Instant::now();
+    let html = match sec_client.get_text(&request).await {
+        Ok(html) => html,
+        Err(error) => {
+            return HtmlFilingBatch {
+                numeric_fallbacks: Vec::new(),
+                narrative_sections: Vec::new(),
+                issues: vec![html_warning_issue(
+                    &filing,
+                    format!("HTML fallback download failed and was skipped: {error}"),
+                )],
+                timing: None,
+            };
+        }
+    };
+    let download_ms = started.elapsed().as_millis();
+
+    let started = Instant::now();
+    let extracted = match html_extractor.extract(&html, &filing) {
+        Ok(extracted) => extracted,
+        Err(error) => {
+            return HtmlFilingBatch {
+                numeric_fallbacks: Vec::new(),
+                narrative_sections: Vec::new(),
+                issues: vec![html_warning_issue(
+                    &filing,
+                    format!("HTML fallback extraction failed and was skipped: {error}"),
+                )],
+                timing: None,
+            };
+        }
+    };
+    let extract_ms = started.elapsed().as_millis();
+
+    HtmlFilingBatch {
+        numeric_fallbacks: extracted.numeric_fallbacks,
+        narrative_sections: extracted.narrative_sections,
+        issues: Vec::new(),
+        timing: Some(HtmlFilingTiming {
+            accession_number: filing.accession_number,
+            form_type: filing.form_type.as_str().to_string(),
+            download_ms,
+            extract_ms,
+            total_ms: download_ms + extract_ms,
+        }),
+    }
+}
+
+fn merge_html_filing_batch(
+    batch: HtmlFilingBatch,
+    combined: &mut HtmlExtractionResult,
+    issues: &mut Vec<NormalizationIssue>,
+    timings: &mut Vec<HtmlFilingTiming>,
+) {
+    combined.numeric_fallbacks.extend(batch.numeric_fallbacks);
+    combined.narrative_sections.extend(batch.narrative_sections);
+    issues.extend(batch.issues);
+    if let Some(timing) = batch.timing {
+        timings.push(timing);
+    }
+}
+
+fn top_slowest_html_timings(mut timings: Vec<HtmlFilingTiming>) -> Vec<HtmlFilingTiming> {
+    timings.sort_by(|left, right| right.total_ms.cmp(&left.total_ms));
+    timings.truncate(5);
+    timings
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -672,6 +830,61 @@ mod tests {
             PeriodContext::Duration { start, end }
                 if start == date!(2024 - 01 - 01) && end == date!(2024 - 03 - 31)
         ));
+    }
+
+    #[test]
+    fn html_filing_timings_keep_slowest_five_in_descending_order() {
+        let timings = top_slowest_html_timings(vec![
+            HtmlFilingTiming {
+                accession_number: "a".to_string(),
+                form_type: "10-Q".to_string(),
+                download_ms: 10,
+                extract_ms: 10,
+                total_ms: 20,
+            },
+            HtmlFilingTiming {
+                accession_number: "b".to_string(),
+                form_type: "10-Q".to_string(),
+                download_ms: 5,
+                extract_ms: 95,
+                total_ms: 100,
+            },
+            HtmlFilingTiming {
+                accession_number: "c".to_string(),
+                form_type: "10-K".to_string(),
+                download_ms: 10,
+                extract_ms: 70,
+                total_ms: 80,
+            },
+            HtmlFilingTiming {
+                accession_number: "d".to_string(),
+                form_type: "10-Q".to_string(),
+                download_ms: 10,
+                extract_ms: 50,
+                total_ms: 60,
+            },
+            HtmlFilingTiming {
+                accession_number: "e".to_string(),
+                form_type: "10-K".to_string(),
+                download_ms: 10,
+                extract_ms: 40,
+                total_ms: 50,
+            },
+            HtmlFilingTiming {
+                accession_number: "f".to_string(),
+                form_type: "10-Q".to_string(),
+                download_ms: 10,
+                extract_ms: 30,
+                total_ms: 40,
+            },
+        ]);
+
+        let accessions = timings
+            .iter()
+            .map(|timing| timing.accession_number.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(accessions, vec!["b", "c", "d", "e", "f"]);
     }
 
     #[test]

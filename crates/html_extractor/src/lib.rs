@@ -10,6 +10,7 @@ use filing_models::{
     Provenance, ReportingPeriod, SignConvention, SourceLocator, SourceType, TextBlock, ValueScale,
 };
 use scraper::{ElementRef, Html, Selector};
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +75,7 @@ pub enum HtmlExtractionError {
 #[derive(Debug, Clone)]
 pub struct HtmlExtractor {
     registry: MetricRegistry,
+    alias_index: HashMap<String, Vec<MetricId>>,
 }
 
 impl Default for HtmlExtractor {
@@ -84,7 +86,8 @@ impl Default for HtmlExtractor {
 
 impl HtmlExtractor {
     pub fn new(registry: MetricRegistry) -> Self {
-        Self { registry }
+        let alias_index = build_alias_index(&registry);
+        Self { registry, alias_index }
     }
 
     pub fn extract(
@@ -131,9 +134,10 @@ impl HtmlExtractor {
         let mut extracted = Vec::new();
 
         for table in document.select(&table_selector) {
+            let structured_rows = collect_structured_table_rows(&table, &row_selector, &cell_selector);
             let table_caption_context =
                 table.select(&caption_selector).next().map(text_content).unwrap_or_default();
-            let header_context = infer_table_context(&table, &row_selector, &cell_selector);
+            let header_context = infer_table_context(&structured_rows);
             let bare_annual_context = if table_caption_context.trim().is_empty() {
                 header_context.clone()
             } else {
@@ -141,13 +145,11 @@ impl HtmlExtractor {
             };
             let default_table_context = table_caption_context.clone();
             let table_scale = infer_scale(&default_table_context);
-            let header_cells = table
-                .select(&row_selector)
-                .next()
-                .map(|row| row.select(&cell_selector).map(text_content).collect::<Vec<_>>())
+            let header_cells = structured_rows
+                .first()
+                .map(|row| row.iter().map(|cell| cell.text.clone()).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let column_periods =
-                table_column_periods(&table, &cell_selector, filing, &bare_annual_context);
+            let column_periods = table_column_periods(&structured_rows, filing, &bare_annual_context);
             let table_context =
                 if !column_periods.is_empty() && table_caption_context.trim().is_empty() {
                     header_context.clone()
@@ -159,18 +161,21 @@ impl HtmlExtractor {
             } else {
                 table_context.clone()
             };
+            let skip_generic_extraction =
+                should_skip_generic_table_extraction(&provenance_context);
 
             extracted.extend(self.extract_debt_note_table_metrics(
-                &table,
-                &row_selector,
-                &cell_selector,
+                &structured_rows,
                 filing,
                 &provenance_context,
                 table_scale,
             ));
 
-            for row in table.select(&row_selector) {
-                let structured_cells = structured_row_cells(&row, &cell_selector);
+            if skip_generic_extraction {
+                continue;
+            }
+
+            for structured_cells in &structured_rows {
                 let cells: Vec<String> =
                     structured_cells.iter().map(|cell| cell.text.clone()).collect();
                 if cells.len() < 2 {
@@ -674,18 +679,12 @@ impl HtmlExtractor {
 
     fn extract_debt_note_table_metrics(
         &self,
-        table: &ElementRef<'_>,
-        row_selector: &Selector,
-        cell_selector: &Selector,
+        rows: &[Vec<HtmlTableCell>],
         filing: &FilingMetadata,
         provenance_context: &str,
         table_scale: ValueScale,
     ) -> Vec<ExtractedHtmlMetricValue> {
-        let rows = table
-            .select(row_selector)
-            .map(|row| structured_row_cells(&row, cell_selector))
-            .filter(|row| row.len() >= 2)
-            .collect::<Vec<_>>();
+        let rows = rows.iter().filter(|row| row.len() >= 2).cloned().collect::<Vec<_>>();
         let Some((rate_column, carrying_value_column)) = debt_metric_columns(&rows) else {
             return Vec::new();
         };
@@ -693,6 +692,8 @@ impl HtmlExtractor {
             return Vec::new();
         }
 
+        let financial_funding_summary =
+            looks_like_financial_funding_summary_table(provenance_context);
         let mut notes_and_bonds_total = 0.0_f64;
         let mut notes_and_bonds_found = false;
         let mut revolver_value = None;
@@ -724,7 +725,10 @@ impl HtmlExtractor {
             }
 
             if let Some(rate) = interest_rate {
-                if is_interest_rate_row(&normalized_row) || is_revolver_row(&normalized_row) {
+                if is_interest_rate_row(&normalized_row)
+                    || is_revolver_row(&normalized_row)
+                    || (financial_funding_summary && is_financial_funding_row(&normalized_row))
+                {
                     interest_rate_candidates.push((
                         interest_rate_priority(&normalized_row),
                         row_label.clone(),
@@ -840,23 +844,12 @@ impl HtmlExtractor {
         normalized_row: &str,
         table_context: &str,
     ) -> Option<&'a DomainMetric> {
-        self.registry
-            .all()
-            .iter()
-            .filter(|metric| {
-                !matches!(
-                    metric.definition.domain,
-                    accounting_domains::DomainName::Footnotes
-                        | accounting_domains::DomainName::Mda
-                        | accounting_domains::DomainName::Valuation
-                        | accounting_domains::DomainName::RiskFactorsSkeleton
-                        | accounting_domains::DomainName::CompanyOverview
-                        | accounting_domains::DomainName::FilingIndex
-                        | accounting_domains::DomainName::Schema
-                        | accounting_domains::DomainName::Provenance
-                )
-            })
-            .find(|metric| row_label_matches_metric(normalized_row, table_context, metric))
+        self.alias_index
+            .get(normalized_row)
+            .into_iter()
+            .flat_map(|metric_ids| metric_ids.iter())
+            .filter_map(|metric_id| self.registry.by_id(metric_id.as_str()))
+            .find(|metric| table_context_supports_metric(table_context, metric))
     }
 }
 
@@ -891,21 +884,40 @@ impl RowLabelQuality {
     }
 }
 
-fn row_label_matches_metric(
-    normalized_row: &str,
-    table_context: &str,
-    metric: &DomainMetric,
-) -> bool {
-    let aliases = html_metric_aliases(metric.definition.metric_id.as_str());
-    if aliases.is_empty() {
-        return false;
+fn build_alias_index(registry: &MetricRegistry) -> HashMap<String, Vec<MetricId>> {
+    let mut alias_index = HashMap::new();
+
+    for metric in registry.all().iter().filter(|metric| {
+        !matches!(
+            metric.definition.domain,
+            accounting_domains::DomainName::Footnotes
+                | accounting_domains::DomainName::Mda
+                | accounting_domains::DomainName::Valuation
+                | accounting_domains::DomainName::RiskFactorsSkeleton
+                | accounting_domains::DomainName::CompanyOverview
+                | accounting_domains::DomainName::FilingIndex
+                | accounting_domains::DomainName::Schema
+                | accounting_domains::DomainName::Provenance
+        )
+    }) {
+        for alias in html_metric_aliases(metric.definition.metric_id.as_str()) {
+            alias_index
+                .entry((*alias).to_string())
+                .or_insert_with(Vec::new)
+                .push(metric.definition.metric_id.clone());
+        }
     }
 
-    if !table_context_supports_metric(table_context, metric) {
-        return false;
-    }
+    alias_index
+}
 
-    aliases.iter().any(|alias| normalized_row == *alias)
+fn should_skip_generic_table_extraction(table_context: &str) -> bool {
+    let normalized = normalize_label(table_context);
+    normalized.contains("reference table")
+        || normalized.contains("reference")
+        || normalized.contains("assets and liabilities measured at fair value on a recurring basis")
+        || normalized.contains("derivative netting adjustments")
+        || normalized.contains("fair value hierarchy")
 }
 
 fn looks_like_debt_note_table(
@@ -929,7 +941,10 @@ fn debt_metric_columns(rows: &[Vec<HtmlTableCell>]) -> Option<(Option<usize>, Op
     for row in rows.iter().take(3) {
         for cell in row {
             let normalized = normalize_label(&cell.text);
-            if rate_column.is_none() && normalized.contains("effective interest rate") {
+            if rate_column.is_none()
+                && (normalized.contains("effective interest rate")
+                    || normalized == "interest rate")
+            {
                 rate_column = Some(cell.display_column_start);
             }
             if carrying_value_column.is_none() && normalized.contains("carrying value") {
@@ -974,18 +989,35 @@ fn is_interest_rate_row(normalized_row: &str) -> bool {
         || is_revolver_row(normalized_row)
 }
 
+fn is_financial_funding_row(normalized_row: &str) -> bool {
+    normalized_row == "long term debt"
+        || normalized_row == "short term borrowings"
+        || normalized_row == "deposits"
+        || normalized_row == "total"
+}
+
 fn interest_rate_priority(normalized_row: &str) -> u8 {
     if normalized_row.contains("weighted average") {
         0
+    } else if normalized_row == "long term debt" {
+        1
     } else if normalized_row.contains("fixed rate debt")
         || normalized_row.contains("floating rate debt")
     {
-        1
-    } else if is_revolver_row(normalized_row) {
         2
-    } else {
+    } else if is_revolver_row(normalized_row) {
         3
+    } else {
+        4
     }
+}
+
+fn looks_like_financial_funding_summary_table(table_context: &str) -> bool {
+    let normalized = normalize_label(table_context);
+    normalized.contains("long term debt")
+        && normalized.contains("short term borrowings")
+        && normalized.contains("deposits")
+        && normalized.contains("total")
 }
 
 fn build_debt_note_metric(
@@ -1071,18 +1103,17 @@ fn select_numeric_cell_for_filing(
 }
 
 fn table_column_periods(
-    table: &ElementRef<'_>,
-    cell_selector: &Selector,
+    structured_rows: &[Vec<HtmlTableCell>],
     filing: &FilingMetadata,
     table_context: &str,
 ) -> Vec<HtmlColumnPeriod> {
-    let row_selector = selector("tr");
     let mut best_match = Vec::new();
     let allow_bare_annual_headers = table_context_supports_bare_annual_headers(table_context);
 
-    for row in table.select(&row_selector).take(4) {
-        let periods = structured_row_cells(&row, cell_selector)
-            .into_iter()
+    for row in structured_rows.iter().take(4) {
+        let periods = row
+            .iter()
+            .cloned()
             .filter_map(|cell| {
                 if is_reference_header(&cell.text) {
                     return None;
@@ -1124,6 +1155,17 @@ fn structured_row_cells(row: &ElementRef<'_>, cell_selector: &Selector) -> Vec<H
             display_column_start += colspan;
             structured
         })
+        .collect()
+}
+
+fn collect_structured_table_rows(
+    table: &ElementRef<'_>,
+    row_selector: &Selector,
+    cell_selector: &Selector,
+) -> Vec<Vec<HtmlTableCell>> {
+    table
+        .select(row_selector)
+        .map(|row| structured_row_cells(&row, cell_selector))
         .collect()
 }
 
@@ -1242,15 +1284,11 @@ fn table_context_supports_bare_annual_headers(table_context: &str) -> bool {
         || normalized.contains("statements of stockholders equity")
 }
 
-fn infer_table_context(
-    table: &ElementRef<'_>,
-    row_selector: &Selector,
-    cell_selector: &Selector,
-) -> String {
-    table
-        .select(row_selector)
+fn infer_table_context(structured_rows: &[Vec<HtmlTableCell>]) -> String {
+    structured_rows
+        .iter()
         .take(3)
-        .flat_map(|row| structured_row_cells(&row, cell_selector))
+        .flat_map(|row| row.iter().cloned())
         .map(|cell| cell.text)
         .filter(|text| {
             let normalized = normalize_label(text);
@@ -2178,6 +2216,44 @@ mod tests {
             source_types: vec![SourceType::Html],
             is_amendment: false,
         }
+    }
+
+    #[test]
+    fn collect_structured_table_rows_preserves_row_structure_and_colspans() {
+        let document = Html::parse_document(
+            r#"
+            <html>
+              <body>
+                <table>
+                  <tr>
+                    <th>Label</th>
+                    <th colspan="2">December 31, 2024</th>
+                  </tr>
+                  <tr>
+                    <th>Cash and cash equivalents</th>
+                    <td>$</td>
+                    <td>415</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+            "#,
+        );
+        let table_selector = selector("table");
+        let row_selector = selector("tr");
+        let cell_selector = selector("th, td");
+        let table = document
+            .select(&table_selector)
+            .next()
+            .expect("table should exist");
+
+        let rows = collect_structured_table_rows(&table, &row_selector, &cell_selector);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1].text, "December 31, 2024");
+        assert_eq!(rows[0][1].display_column_start, 1);
+        assert_eq!(rows[0][1].display_column_end, 2);
+        assert_eq!(rows[1][2].text, "415");
     }
 
     #[test]
@@ -3170,6 +3246,137 @@ mod tests {
                 .iter()
                 .any(|metric| metric.metric_id.as_str() == "debt_and_credit.interest_rate")
         );
+    }
+
+    #[test]
+    fn rejects_long_term_debt_and_interest_rate_from_fair_value_tables() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Assets and liabilities measured at fair value on a recurring basis</caption>
+                  <tr>
+                    <th>Fair value hierarchy</th>
+                    <th>Long-term debt</th>
+                    <th>Interest rate</th>
+                  </tr>
+                  <tr>
+                    <th>Level 2</th>
+                    <td>31394</td>
+                    <td>2.31%</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        assert!(
+            extracted
+                .iter()
+                .all(|metric| metric.metric_id.as_str() != "balance_sheet.long_term_debt")
+        );
+        assert!(
+            extracted
+                .iter()
+                .all(|metric| metric.metric_id.as_str() != "debt_and_credit.interest_rate")
+        );
+    }
+
+    #[test]
+    fn keeps_interest_rate_from_funding_summary_table() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>June 30, 2024 December 31, 2023 Long-term debt Short-term borrowings Deposits Total</caption>
+                  <tr>
+                    <th>Category</th>
+                    <th>Interest rate</th>
+                  </tr>
+                  <tr>
+                    <th>Long-term debt</th>
+                    <td>4.29%</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        assert!(
+            extracted
+                .iter()
+                .any(|metric| metric.metric_id.as_str() == "debt_and_credit.interest_rate")
+        );
+    }
+
+    #[test]
+    fn skips_generic_extraction_for_reference_only_tables() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Reference table and derivative netting adjustments</caption>
+                  <tr>
+                    <th>Reference</th>
+                    <th>Amount</th>
+                  </tr>
+                  <tr>
+                    <th>Long-term debt</th>
+                    <td>31394</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn skips_generic_extraction_for_fair_value_recurring_basis_tables() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Assets and liabilities measured at fair value on a recurring basis</caption>
+                  <tr>
+                    <th>Category</th>
+                    <th>Long-term debt</th>
+                  </tr>
+                  <tr>
+                    <th>Level 2</th>
+                    <td>31394</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        assert!(extracted.is_empty());
     }
 
     #[test]
