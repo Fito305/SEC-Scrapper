@@ -617,6 +617,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_same_accession_segment_duplicate_issue(metric_id, values) {
+        return true;
+    }
+
     if suppress_same_accession_notes_and_bonds_duplicate_issue(metric_id, values) {
         return true;
     }
@@ -639,6 +643,23 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
 
     let best_rank_count = ranks.iter().filter(|rank| *rank == best_rank).count();
     best_rank_count == 1
+}
+
+fn suppress_same_accession_segment_duplicate_issue(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if !metric_id.starts_with("segment_data.") || values.len() < 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+
+    values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
 }
 
 fn suppress_same_accession_notes_and_bonds_duplicate_issue(
@@ -2128,6 +2149,53 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "same-accession debt note alternates should remain reviewable in provenance without main warning noise"
+        );
+    }
+
+    #[test]
+    fn same_accession_segment_alternates_stay_in_provenance_without_main_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut dominant = sample_segment_value(
+            SourceType::Html,
+            86_789.0,
+            "Industrial Segment",
+            "2020 10-K",
+            "0000040545-20-000009",
+        );
+        let period = sample_duration_reporting_period(2018, 2018);
+        set_reporting_period(&mut dominant, period.clone());
+
+        let mut alternate = dominant.clone();
+        alternate.amount = 86_075.0;
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: dominant,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: alternate,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "same-accession segment alternates should remain reviewable in provenance without main warning noise"
         );
     }
 
