@@ -621,6 +621,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_repeated_segment_value_sets_across_filings(metric_id, values) {
+        return true;
+    }
+
     if suppress_same_accession_notes_and_bonds_duplicate_issue(metric_id, values) {
         return true;
     }
@@ -660,6 +664,47 @@ fn suppress_same_accession_segment_duplicate_issue(
     values
         .iter()
         .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+}
+
+fn suppress_repeated_segment_value_sets_across_filings(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if !metric_id.starts_with("segment_data.") || values.len() < 4 {
+        return false;
+    }
+
+    let mut by_accession: std::collections::BTreeMap<&str, Vec<&NumericValue>> =
+        std::collections::BTreeMap::new();
+    for value in values {
+        by_accession
+            .entry(value.provenance.accession_number.as_str())
+            .or_default()
+            .push(value);
+    }
+
+    if by_accession.len() < 2 {
+        return false;
+    }
+
+    let mut patterns = by_accession
+        .values()
+        .map(|group| {
+            let mut amounts = group.iter().map(|value| value.amount).collect::<Vec<_>>();
+            amounts.sort_by(|left, right| left.total_cmp(right));
+            amounts
+        })
+        .collect::<Vec<_>>();
+
+    patterns.dedup_by(|left, right| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(l, r)| !amounts_differ(*l, *r))
+    });
+
+    patterns.len() == 1
 }
 
 fn suppress_same_accession_notes_and_bonds_duplicate_issue(
@@ -2196,6 +2241,79 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "same-accession segment alternates should remain reviewable in provenance without main warning noise"
+        );
+    }
+
+    #[test]
+    fn repeated_segment_value_sets_across_filings_do_not_create_main_warning_noise() {
+        let normalizer = Normalizer::new();
+        let period = sample_duration_reporting_period(2020, 2020);
+
+        let mut first_primary = sample_segment_value(
+            SourceType::Html,
+            17_589.0,
+            "Power Segment",
+            "2022 10-K",
+            "0000040545-22-000008",
+        );
+        set_reporting_period(&mut first_primary, period.clone());
+
+        let mut first_alternate = first_primary.clone();
+        first_alternate.amount = 17_237.0;
+
+        let mut second_primary = sample_segment_value(
+            SourceType::Html,
+            17_589.0,
+            "Power Segment",
+            "2023 10-K",
+            "0000040545-23-000023",
+        );
+        set_reporting_period(&mut second_primary, period.clone());
+
+        let mut second_alternate = second_primary.clone();
+        second_alternate.amount = 17_237.0;
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: first_primary,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: first_alternate,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: second_primary,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: second_alternate,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 4);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "repeated identical same-segment amount sets across later filings should remain reviewable in provenance without main warning noise"
         );
     }
 
