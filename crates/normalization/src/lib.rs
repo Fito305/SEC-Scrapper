@@ -625,6 +625,14 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_same_accession_revenue_inline_xbrl_pair(metric_id, values) {
+        return true;
+    }
+
+    if suppress_same_accession_dominant_cogs_pair(metric_id, values) {
+        return true;
+    }
+
     if suppress_same_accession_notes_and_bonds_duplicate_issue(metric_id, values) {
         return true;
     }
@@ -705,6 +713,54 @@ fn suppress_repeated_segment_value_sets_across_filings(
     });
 
     patterns.len() == 1
+}
+
+fn suppress_same_accession_revenue_inline_xbrl_pair(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if metric_id != "income_statement.revenue" || values.len() != 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return false;
+    }
+
+    let tagged_count = values
+        .iter()
+        .filter(|value| value.provenance.xbrl_tag.as_deref().is_some())
+        .count();
+    tagged_count == 1
+}
+
+fn suppress_same_accession_dominant_cogs_pair(metric_id: &str, values: &[NumericValue]) -> bool {
+    if metric_id != "income_statement.cost_of_goods_sold" || values.len() != 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return false;
+    }
+
+    let mut amounts = values.iter().map(|value| value.amount.abs()).collect::<Vec<_>>();
+    amounts.sort_by(|left, right| right.total_cmp(left));
+    let dominant = amounts[0];
+    let smaller = amounts[1];
+
+    dominant >= 1000.0 && smaller <= dominant * 0.5
 }
 
 fn suppress_same_accession_notes_and_bonds_duplicate_issue(
@@ -2377,6 +2433,117 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "identical same-accession revenue values should collapse before warning generation"
+        );
+    }
+
+    #[test]
+    fn same_accession_revenue_inline_xbrl_pair_stays_in_provenance_without_main_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut inline_xbrl = sample_numeric_value(SourceType::Html, 28_831.0);
+        inline_xbrl.label = Some("Revenue".to_string());
+        inline_xbrl.provenance.filing_label = Some("Revenue".to_string());
+        inline_xbrl.provenance.source_location.row_label = Some("Revenue".to_string());
+        inline_xbrl.provenance.accession_number = "0000040545-19-000053".to_string();
+        inline_xbrl.provenance.xbrl_tag = Some("us-gaap:Revenues".to_string());
+        set_reporting_period(
+            &mut inline_xbrl,
+            ReportingPeriod {
+                context: PeriodContext::Duration {
+                    start: date!(2019 - 04 - 01),
+                    end: date!(2019 - 06 - 30),
+                },
+                fiscal_period: None,
+                label: None,
+            },
+        );
+
+        let mut html_total = inline_xbrl.clone();
+        html_total.amount = 8_245.0;
+        html_total.provenance.xbrl_tag = None;
+        html_total.provenance.filing_label = Some("Total revenues".to_string());
+        html_total.provenance.source_location.row_label = Some("Total revenues".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.revenue"),
+                    metric_name: "Revenue".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: inline_xbrl,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.revenue"),
+                    metric_name: "Revenue".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: html_total,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "same-accession inline xbrl revenue plus html total should stay reviewable in provenance without main warning noise"
+        );
+    }
+
+    #[test]
+    fn same_accession_dominant_cogs_pair_stays_in_provenance_without_main_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut dominant = sample_numeric_value(SourceType::Html, 17_703.0);
+        dominant.label = Some("Cost of revenue".to_string());
+        dominant.provenance.filing_label = Some("Cost of revenue".to_string());
+        dominant.provenance.source_location.row_label = Some("Cost of revenue".to_string());
+        dominant.provenance.accession_number = "0000040545-25-000015".to_string();
+        set_reporting_period(
+            &mut dominant,
+            ReportingPeriod {
+                context: PeriodContext::Instant {
+                    as_of: date!(2024 - 12 - 31),
+                },
+                fiscal_period: None,
+                label: None,
+            },
+        );
+
+        let mut smaller = dominant.clone();
+        smaller.amount = 7_237.0;
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: dominant,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: smaller,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "same-accession dominant cost pair should stay reviewable in provenance without main warning noise"
         );
     }
 
