@@ -352,6 +352,7 @@ impl HtmlExtractor {
         filing: &FilingMetadata,
     ) -> Result<Vec<ExtractedHtmlMetricValue>, HtmlExtractionError> {
         let mut extracted = self.extract_numeric_fallbacks_from_document(document, filing)?;
+        extracted.extend(self.extract_core_inline_xbrl_metrics(html, filing));
         extracted.extend(self.extract_segment_inline_xbrl_metrics(html, filing));
         extracted.extend(self.extract_derivative_inline_xbrl_metrics(html, filing));
         extracted.extend(self.extract_equity_comp_inline_xbrl_metrics(html, filing));
@@ -433,6 +434,89 @@ impl HtmlExtractor {
                 },
             },
         })
+    }
+
+    fn extract_core_inline_xbrl_metrics(
+        &self,
+        html: &str,
+        filing: &FilingMetadata,
+    ) -> Vec<ExtractedHtmlMetricValue> {
+        let core_contexts = inline_xbrl_core_contexts(html);
+        if core_contexts.is_empty() {
+            return Vec::new();
+        }
+
+        let revenue_tags = [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+            "SalesRevenueNet",
+            "SalesRevenueServicesNet",
+        ];
+        let Some(metric) = self.registry.by_id("income_statement.revenue") else {
+            return Vec::new();
+        };
+
+        let mut extracted = Vec::new();
+        for fact in inline_xbrl_nonfraction_facts(html) {
+            let Some(context) = core_contexts.get(&fact.context_ref) else {
+                continue;
+            };
+            let local_name = fact.name.rsplit(':').next().unwrap_or(&fact.name);
+            if !revenue_tags.contains(&local_name) {
+                continue;
+            }
+            let Some((amount, sign_convention)) = parse_numeric_cell(&fact.value) else {
+                continue;
+            };
+            let reporting_period = context
+                .clone()
+                .or_else(|| reporting_period_from_inline_context_id(&fact.context_ref))
+                .unwrap_or_else(|| reporting_period_from_filing(filing));
+            if !core_inline_xbrl_matches_current_filing_period(&reporting_period, filing) {
+                continue;
+            }
+            let unit = measurement_unit_from_inline_unit_ref(fact.unit_ref.as_deref());
+            let scale = inline_xbrl_scale_from_attr(fact.scale.as_deref());
+
+            extracted.push(ExtractedHtmlMetricValue {
+                metric_id: metric.definition.metric_id.clone(),
+                metric_name: metric.definition.display_name.clone(),
+                domain: metric.definition.domain,
+                subdomain: metric.subdomain.clone(),
+                numeric_value: NumericValue {
+                    amount,
+                    unit: unit.clone(),
+                    scale,
+                    sign_convention,
+                    label: Some(fact.value.clone()),
+                    reporting_period: reporting_period.clone(),
+                    provenance: Provenance {
+                        accession_number: filing.accession_number.clone(),
+                        filing_url: filing.filing_urls.primary_document.clone(),
+                        form_type: filing.form_type.clone(),
+                        // This value comes from embedded inline XBRL inside the filing HTML, not
+                        // from row-label fallback matching. Keep it XBRL-typed so review logic
+                        // can distinguish it from conservative HTML fallback values.
+                        source_type: SourceType::Xbrl,
+                        source_method: FilingSourceMethod::FilingHtml,
+                        source_location: SourceLocator {
+                            section_name: Some("inline_xbrl_core".to_string()),
+                            table_name: Some("inline_xbrl_core".to_string()),
+                            row_label: Some(metric.definition.display_name.clone()),
+                            cell_reference: Some(fact.context_ref.clone()),
+                            segment_name: None,
+                        },
+                        xbrl_tag: Some(fact.name.clone()),
+                        filing_label: Some(metric.definition.display_name.clone()),
+                        reporting_period,
+                        unit,
+                        scale,
+                    },
+                },
+            });
+        }
+
+        extracted
     }
 
     fn extract_segment_inline_xbrl_metrics(
@@ -1853,6 +1937,61 @@ fn inline_xbrl_segment_contexts(
     contexts
 }
 
+fn inline_xbrl_core_contexts(
+    html: &str,
+) -> std::collections::BTreeMap<String, Option<ReportingPeriod>> {
+    let mut contexts = std::collections::BTreeMap::new();
+    let mut search_start = 0;
+
+    while let Some(context_index) = html[search_start..].find("<xbrli:context id=\"") {
+        let context_index = search_start + context_index;
+        let id_start = context_index + "<xbrli:context id=\"".len();
+        let Some(id_end_rel) = html[id_start..].find('"') else {
+            break;
+        };
+        let id_end = id_start + id_end_rel;
+        let context_id = &html[id_start..id_end];
+        let Some(close_rel) = html[id_end..].find("</xbrli:context>") else {
+            break;
+        };
+        let context_end = id_end + close_rel;
+        let body = &html[id_end..context_end];
+
+        if !extract_explicit_members(body).is_empty() {
+            search_start = context_end + "</xbrli:context>".len();
+            continue;
+        }
+
+        contexts.insert(
+            context_id.to_string(),
+            reporting_period_from_inline_context_body(body),
+        );
+        search_start = context_end + "</xbrli:context>".len();
+    }
+
+    contexts
+}
+
+fn core_inline_xbrl_matches_current_filing_period(
+    reporting_period: &ReportingPeriod,
+    filing: &FilingMetadata,
+) -> bool {
+    let Some(report_end) = filing.report_period_end else {
+        return true;
+    };
+
+    match (&reporting_period.context, &filing.form_type) {
+        (PeriodContext::Duration { start, end }, filing_models::FilingForm::Form10Q) => {
+            *end == report_end && (*end - *start).whole_days() <= 100
+        }
+        (PeriodContext::Duration { start, end }, filing_models::FilingForm::Form10K) => {
+            *end == report_end && (*end - *start).whole_days() >= 300
+        }
+        (PeriodContext::Instant { as_of }, _) => *as_of == report_end,
+        (PeriodContext::Duration { end, .. }, _) => *end == report_end,
+    }
+}
+
 fn inline_xbrl_derivative_contexts(
     html: &str,
 ) -> std::collections::BTreeMap<String, InlineXbrlDerivativeContext> {
@@ -2519,6 +2658,111 @@ mod tests {
             segment_revenues[0].numeric_value.provenance.source_location.segment_name.as_deref(),
             Some("Consumer Segment")
         );
+    }
+
+    #[test]
+    fn extracts_core_revenue_from_inline_xbrl_without_segment_axes() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_quarterly_filing();
+        let html = r#"
+            <html>
+              <body>
+                <div style="display:none">
+                  <ix:resources>
+                    <xbrli:context id="core_revenue_context">
+                      <xbrli:period>
+                        <xbrli:startDate>2025-01-01</xbrli:startDate>
+                        <xbrli:endDate>2025-03-31</xbrli:endDate>
+                      </xbrli:period>
+                      <xbrli:entity>
+                        <xbrli:identifier scheme="http://www.sec.gov/CIK">0000000000</xbrli:identifier>
+                      </xbrli:entity>
+                    </xbrli:context>
+                    <xbrli:context id="seg_context">
+                      <xbrli:period>
+                        <xbrli:startDate>2025-01-01</xbrli:startDate>
+                        <xbrli:endDate>2025-03-31</xbrli:endDate>
+                      </xbrli:period>
+                      <xbrli:entity>
+                        <xbrli:segment>
+                          <xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis">mmm:ConsumerSegmentMember</xbrldi:explicitMember>
+                        </xbrli:segment>
+                      </xbrli:entity>
+                    </xbrli:context>
+                  </ix:resources>
+                </div>
+                <ix:nonFraction unitRef="usd" contextRef="core_revenue_context" name="us-gaap:Revenues" scale="6">8,080</ix:nonFraction>
+                <ix:nonFraction unitRef="usd" contextRef="seg_context" name="us-gaap:Revenues" scale="6">1,192</ix:nonFraction>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("inline xbrl core extraction should succeed");
+
+        let core_revenue = extracted
+            .iter()
+            .find(|metric| {
+                metric.metric_id.as_str() == "income_statement.revenue"
+                    && metric.numeric_value.provenance.source_location.section_name.as_deref()
+                        == Some("inline_xbrl_core")
+            })
+            .expect("core revenue should be extracted");
+
+        assert_eq!(core_revenue.numeric_value.amount, 8080.0);
+        assert_eq!(core_revenue.numeric_value.provenance.source_type, SourceType::Xbrl);
+        assert!(matches!(
+            core_revenue.numeric_value.reporting_period.context,
+            PeriodContext::Duration { start, end }
+                if start == date!(2025 - 01 - 01) && end == date!(2025 - 03 - 31)
+        ));
+    }
+
+    #[test]
+    fn core_inline_xbrl_revenue_skips_ytd_comparative_contexts_for_quarterly_filing() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_quarterly_filing();
+        let html = r#"
+            <html>
+              <body>
+                <div style="display:none">
+                  <ix:resources>
+                    <xbrli:context id="quarter_context">
+                      <xbrli:period>
+                        <xbrli:startDate>2025-01-01</xbrli:startDate>
+                        <xbrli:endDate>2025-03-31</xbrli:endDate>
+                      </xbrli:period>
+                    </xbrli:context>
+                    <xbrli:context id="ytd_context">
+                      <xbrli:period>
+                        <xbrli:startDate>2024-10-01</xbrli:startDate>
+                        <xbrli:endDate>2025-03-31</xbrli:endDate>
+                      </xbrli:period>
+                    </xbrli:context>
+                  </ix:resources>
+                </div>
+                <ix:nonFraction unitRef="usd" contextRef="quarter_context" name="us-gaap:Revenues" scale="6">8,080</ix:nonFraction>
+                <ix:nonFraction unitRef="usd" contextRef="ytd_context" name="us-gaap:Revenues" scale="6">15,900</ix:nonFraction>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("inline xbrl core extraction should succeed");
+
+        let revenues = extracted
+            .iter()
+            .filter(|metric| {
+                metric.metric_id.as_str() == "income_statement.revenue"
+                    && metric.numeric_value.provenance.source_location.section_name.as_deref()
+                        == Some("inline_xbrl_core")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(revenues.len(), 1);
+        assert_eq!(revenues[0].numeric_value.amount, 8080.0);
     }
 
     #[test]

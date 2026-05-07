@@ -6,7 +6,7 @@
 use accounting_domains::MetricId;
 use app_core::AppConfig;
 use filing_discovery::{FilingDiscoveryError, FilingDiscoveryService, FilingHistoryCoverage};
-use filing_models::{Cik, CompanyId, CompanyIdentity, FilingMetadata, Ticker};
+use filing_models::{Cik, CompanyId, CompanyIdentity, FilingMetadata, SourceType, Ticker};
 use html_extractor::{HtmlExtractionError, HtmlExtractionResult, HtmlExtractor};
 use normalization::{
     NormalizationIssue, NormalizationIssueSeverity, NormalizationResult, Normalizer,
@@ -417,7 +417,9 @@ fn append_analyst_review_issues(normalized: &mut NormalizationResult) {
         }
 
         for metric in matching {
-            if metric.primary_source == normalization::NormalizationSource::HtmlFallback {
+            if metric.primary_source == normalization::NormalizationSource::HtmlFallback
+                && metric.value.provenance.source_type != SourceType::Xbrl
+            {
                 normalized.issues.push(NormalizationIssue {
                     severity: NormalizationIssueSeverity::Warning,
                     code: "analyst_critical_metric_html_only",
@@ -749,6 +751,67 @@ mod tests {
             issue.code == "analyst_critical_metric_missing"
                 && issue.metric_id.as_ref().map(|id| id.as_str())
                     == Some("income_statement.revenue")
+        }));
+    }
+
+    #[test]
+    fn analyst_review_does_not_flag_inline_xbrl_backed_html_primary_as_html_only() {
+        let reporting_period = ReportingPeriod {
+            context: PeriodContext::Duration {
+                start: date!(2024 - 04 - 01),
+                end: date!(2024 - 06 - 30),
+            },
+            fiscal_period: None,
+            label: None,
+        };
+        let mut normalized = NormalizationResult {
+            numeric_metrics: vec![normalization::NormalizedNumericMetric {
+                metric_id: MetricId::new("income_statement.revenue"),
+                period_key: "2024-04-01_to_2024-06-30".to_string(),
+                domain: accounting_domains::DomainName::IncomeStatement,
+                metric_name: "Revenue".to_string(),
+                subdomain: Some("operating_results".to_string()),
+                value: NumericValue {
+                    amount: 8080.0,
+                    unit: MeasurementUnit::Currency("USD".to_string()),
+                    scale: ValueScale::Millions,
+                    sign_convention: SignConvention::AsReported,
+                    label: Some("Revenue".to_string()),
+                    reporting_period: reporting_period.clone(),
+                    provenance: Provenance {
+                        accession_number: "0000000000-24-000001".to_string(),
+                        filing_url: Some("https://example.test/inline.htm".to_string()),
+                        form_type: FilingForm::Form10Q,
+                        source_type: SourceType::Xbrl,
+                        source_method: FilingSourceMethod::FilingHtml,
+                        source_location: SourceLocator {
+                            section_name: Some("inline_xbrl_core".to_string()),
+                            table_name: Some("inline_xbrl_core".to_string()),
+                            row_label: Some("Revenue".to_string()),
+                            cell_reference: Some("core_revenue_context".to_string()),
+                            segment_name: None,
+                        },
+                        xbrl_tag: Some("us-gaap:Revenues".to_string()),
+                        filing_label: Some("Revenue".to_string()),
+                        reporting_period: reporting_period.clone(),
+                        unit: MeasurementUnit::Currency("USD".to_string()),
+                        scale: ValueScale::Millions,
+                    },
+                },
+                primary_source: normalization::NormalizationSource::HtmlFallback,
+                decision: normalization::NormalizationDecision::HtmlOnly,
+                alternative_value: None,
+                source_values: Vec::new(),
+            }],
+            ..NormalizationResult::default()
+        };
+
+        append_analyst_review_issues(&mut normalized);
+
+        assert!(normalized.issues.iter().all(|issue| {
+            !(issue.code == "analyst_critical_metric_html_only"
+                && issue.metric_id.as_ref().map(|id| id.as_str())
+                    == Some("income_statement.revenue"))
         }));
     }
 

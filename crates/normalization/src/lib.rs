@@ -365,6 +365,8 @@ fn normalize_numeric_metric(
     prune_html_outlier_values(&candidates.metric_id, &mut candidates.html);
     rank_source_values(&candidates.metric_id, &mut candidates.xbrl);
     rank_source_values(&candidates.metric_id, &mut candidates.html);
+    promote_segment_inline_xbrl_aggregate_totals(&candidates.metric_id, &mut candidates.html);
+    prefer_same_accession_notes_and_bonds_total(&candidates.metric_id, &mut candidates.html);
     prune_metric_specific_history_duplicates(&candidates.metric_id, &mut candidates.html);
     collapse_same_accession_duplicates(candidates.domain, &mut candidates.xbrl);
     collapse_same_accession_duplicates(candidates.domain, &mut candidates.html);
@@ -611,6 +613,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return false;
     }
 
+    if suppress_segment_inline_xbrl_component_duplicate_issue(metric_id, values) {
+        return true;
+    }
+
     let supports_history_suppression = metric_id.starts_with("segment_data.")
         || metric_id == "debt_and_credit.notes_and_bonds";
     if !supports_history_suppression {
@@ -629,6 +635,176 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
 
     let best_rank_count = ranks.iter().filter(|rank| *rank == best_rank).count();
     best_rank_count == 1
+}
+
+fn suppress_segment_inline_xbrl_component_duplicate_issue(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if !metric_id.starts_with("segment_data.") {
+        return false;
+    }
+
+    let representative_values = segment_inline_xbrl_representative_values(values);
+    if representative_values.is_empty() {
+        return false;
+    }
+
+    if representative_values.len() == 1 || duplicate_values_are_identical(&representative_values) {
+        return true;
+    }
+
+    let mut ranks = representative_values
+        .iter()
+        .map(|value| history_rank(metric_id, value))
+        .collect::<Vec<_>>();
+    ranks.sort();
+
+    let Some(best_rank) = ranks.first() else {
+        return false;
+    };
+
+    ranks.iter().filter(|rank| *rank == best_rank).count() == 1
+}
+
+fn promote_segment_inline_xbrl_aggregate_totals(metric_id: &str, values: &mut [NumericValue]) {
+    if !metric_id.starts_with("segment_data.") || values.len() < 2 {
+        return;
+    }
+
+    let aggregate_keys = segment_inline_xbrl_aggregate_keys(values);
+    if aggregate_keys.is_empty() {
+        return;
+    }
+
+    values.sort_by(|left, right| {
+        let left_rank = u8::from(!aggregate_keys.contains(&segment_inline_xbrl_value_key(left)));
+        let right_rank =
+            u8::from(!aggregate_keys.contains(&segment_inline_xbrl_value_key(right)));
+
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| history_rank(metric_id, left).cmp(&history_rank(metric_id, right)))
+            .then_with(|| left.provenance.accession_number.cmp(&right.provenance.accession_number))
+    });
+}
+
+fn prefer_same_accession_notes_and_bonds_total(metric_id: &str, values: &mut [NumericValue]) {
+    if metric_id != "debt_and_credit.notes_and_bonds" || values.len() < 2 {
+        return;
+    }
+
+    values.sort_by(|left, right| {
+        let accession_cmp = left.provenance.accession_number.cmp(&right.provenance.accession_number);
+        if accession_cmp != std::cmp::Ordering::Equal {
+            return history_rank(metric_id, left).cmp(&history_rank(metric_id, right));
+        }
+
+        right
+            .amount
+            .abs()
+            .total_cmp(&left.amount.abs())
+            .then_with(|| history_rank(metric_id, left).cmp(&history_rank(metric_id, right)))
+            .then_with(|| {
+                left.provenance
+                    .filing_label
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.provenance.filing_label.as_deref().unwrap_or_default())
+            })
+    });
+}
+
+fn segment_inline_xbrl_representative_values(values: &[NumericValue]) -> Vec<NumericValue> {
+    let aggregate_keys = segment_inline_xbrl_aggregate_keys(values);
+    if aggregate_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut representatives = Vec::new();
+    let mut seen_accessions = std::collections::BTreeSet::new();
+
+    for value in values {
+        if !aggregate_keys.contains(&segment_inline_xbrl_value_key(value)) {
+            continue;
+        }
+
+        if seen_accessions.insert(value.provenance.accession_number.clone()) {
+            representatives.push(value.clone());
+        }
+    }
+
+    representatives
+}
+
+fn segment_inline_xbrl_aggregate_keys(
+    values: &[NumericValue],
+) -> std::collections::BTreeSet<String> {
+    let mut groups: std::collections::BTreeMap<String, Vec<&NumericValue>> =
+        std::collections::BTreeMap::new();
+
+    for value in values {
+        if !is_inline_xbrl_segment_value(value) {
+            continue;
+        }
+        groups
+            .entry(value.provenance.accession_number.clone())
+            .or_default()
+            .push(value);
+    }
+
+    let mut aggregate_keys = std::collections::BTreeSet::new();
+    for group_values in groups.into_values() {
+        let Some(total) = segment_inline_xbrl_aggregate_total(group_values.as_slice()) else {
+            continue;
+        };
+        aggregate_keys.insert(segment_inline_xbrl_value_key(total));
+    }
+
+    aggregate_keys
+}
+
+fn segment_inline_xbrl_aggregate_total<'a>(
+    values: &[&'a NumericValue],
+) -> Option<&'a NumericValue> {
+    if values.len() < 3 {
+        return None;
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| right.amount.total_cmp(&left.amount));
+
+    let total = *sorted.first()?;
+    let components = &sorted[1..];
+    if components.is_empty() {
+        return None;
+    }
+
+    let component_sum = components.iter().map(|value| value.amount).sum::<f64>();
+    if !amounts_differ(total.amount, component_sum) {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn is_inline_xbrl_segment_value(value: &NumericValue) -> bool {
+    value.provenance.source_location.section_name.as_deref() == Some("inline_xbrl_segment")
+        && value.provenance.source_location.table_name.as_deref() == Some("inline_xbrl_segment")
+}
+
+fn segment_inline_xbrl_value_key(value: &NumericValue) -> String {
+    format!(
+        "{}::{}::{}::{}",
+        value.provenance.accession_number,
+        normalized_period_key(&value.reporting_period),
+        value.provenance
+            .source_location
+            .segment_name
+            .as_deref()
+            .unwrap_or_default(),
+        value.amount
+    )
 }
 
 fn collapse_same_accession_duplicates(domain: DomainName, values: &mut Vec<NumericValue>) {
@@ -888,6 +1064,7 @@ fn long_term_debt_rank(value: &NumericValue) -> u8 {
 fn prune_context_mismatches(metric_id: &str, values: &mut Vec<NumericValue>) {
     if metric_id == "income_statement.cost_of_goods_sold" {
         values.retain(|value| !context_contains(value, "percent of net sales"));
+        prune_cost_of_goods_sold_context_mismatches(values);
     } else if metric_id == "balance_sheet.long_term_debt" {
         let has_non_fair_value_candidate = values.iter().any(|value| {
             !context_contains(value, "assets and liabilities measured at fair value")
@@ -916,6 +1093,34 @@ fn prune_context_mismatches(metric_id: &str, values: &mut Vec<NumericValue>) {
                     && !context_contains(value, "derivative netting adjustments")
             });
         }
+    }
+}
+
+fn prune_cost_of_goods_sold_context_mismatches(values: &mut Vec<NumericValue>) {
+    if values.len() < 2 {
+        return;
+    }
+
+    let has_three_month_candidate = values.iter().any(|value| {
+        context_contains(value, "three months ended")
+            && !context_contains(value, "(continued)")
+    });
+    if has_three_month_candidate {
+        values.retain(|value| {
+            !context_contains(value, "six months ended")
+                && !context_contains(value, "nine months ended")
+                && !context_contains(value, "(continued)")
+        });
+        if values.len() < 2 {
+            return;
+        }
+    }
+
+    let has_primary_statement_candidate = values.iter().any(|value| {
+        statement_style_income_context(value) && !context_contains(value, "(continued)")
+    });
+    if has_primary_statement_candidate {
+        values.retain(|value| !context_contains(value, "(continued)"));
     }
 }
 
@@ -961,6 +1166,7 @@ fn statement_style_income_context(value: &NumericValue) -> bool {
         || context_contains(value, "millions, except per-share amounts")
         || context_contains(value, "statement of income")
         || context_contains(value, "statement of operations")
+        || context_contains(value, "statement of earnings")
 }
 
 fn context_contains(value: &NumericValue, needle: &str) -> bool {
@@ -1675,6 +1881,114 @@ mod tests {
     }
 
     #[test]
+    fn cost_of_goods_sold_prefers_three_month_statement_over_six_month_and_continued_rows() {
+        let normalizer = Normalizer::new();
+
+        let mut three_month = sample_numeric_value(SourceType::Html, 14_358.0);
+        three_month.label = Some("Cost of goods sold".to_string());
+        three_month.provenance.filing_label = Some("Cost of goods sold".to_string());
+        three_month.provenance.source_location.row_label = Some("Cost of goods sold".to_string());
+        three_month.provenance.source_location.section_name =
+            Some("STATEMENT OF EARNINGS (LOSS) Three months ended June 30".to_string());
+        three_month.provenance.source_location.table_name =
+            three_month.provenance.source_location.section_name.clone();
+
+        let mut six_month = three_month.clone();
+        six_month.amount = 27_888.0;
+        six_month.provenance.source_location.section_name =
+            Some("STATEMENT OF EARNINGS (LOSS) Six months ended June 30".to_string());
+        six_month.provenance.source_location.table_name =
+            six_month.provenance.source_location.section_name.clone();
+
+        let mut continued = three_month.clone();
+        continued.amount = 27_983.0;
+        continued.provenance.source_location.section_name =
+            Some("STATEMENT OF EARNINGS (LOSS) (CONTINUED) Six months ended June 30".to_string());
+        continued.provenance.source_location.table_name =
+            continued.provenance.source_location.section_name.clone();
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: three_month,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: six_month,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: continued,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 14_358.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 1);
+        assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
+    }
+
+    #[test]
+    fn cost_of_goods_sold_prefers_primary_statement_over_continued_table() {
+        let normalizer = Normalizer::new();
+
+        let mut primary = sample_numeric_value(SourceType::Html, 50_244.0);
+        primary.label = Some("Cost of goods sold".to_string());
+        primary.provenance.filing_label = Some("Cost of goods sold".to_string());
+        primary.provenance.source_location.row_label = Some("Cost of goods sold".to_string());
+        primary.provenance.source_location.section_name =
+            Some("STATEMENT OF EARNINGS (LOSS) Consolidated".to_string());
+        primary.provenance.source_location.table_name =
+            primary.provenance.source_location.section_name.clone();
+
+        let mut continued = primary.clone();
+        continued.amount = 50_265.0;
+        continued.provenance.source_location.section_name =
+            Some("STATEMENT OF EARNINGS (LOSS) (CONTINUED) GE(a) GE Capital".to_string());
+        continued.provenance.source_location.table_name =
+            continued.provenance.source_location.section_name.clone();
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: primary,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.cost_of_goods_sold"),
+                    metric_name: "Cost of Goods Sold".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: continued,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 50_244.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 1);
+        assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
+    }
+
+    #[test]
     fn debt_interest_rate_prefers_summary_rows_over_individual_note_rows() {
         let normalizer = Normalizer::new();
 
@@ -1713,6 +2027,44 @@ mod tests {
 
         assert_eq!(normalized.numeric_metrics[0].value.amount, 3.07);
         assert!(normalized.issues.iter().any(|issue| issue.code == "duplicate_source_values"));
+    }
+
+    #[test]
+    fn notes_and_bonds_prefers_larger_same_accession_total() {
+        let normalizer = Normalizer::new();
+
+        let mut smaller = sample_numeric_value(SourceType::Html, 14_762.0);
+        smaller.label = Some("Senior notes".to_string());
+        smaller.provenance.filing_label = Some("Senior notes".to_string());
+        smaller.provenance.source_location.row_label = Some("Senior notes".to_string());
+        smaller.provenance.accession_number = "0000040545-20-000009".to_string();
+
+        let mut larger = smaller.clone();
+        larger.amount = 25_371.0;
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.notes_and_bonds"),
+                    metric_name: "Notes and Bonds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_structure".to_string()),
+                    numeric_value: smaller,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.notes_and_bonds"),
+                    metric_name: "Notes and Bonds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_structure".to_string()),
+                    numeric_value: larger,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 25_371.0);
     }
 
     #[test]
@@ -2420,6 +2772,85 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "identical same-accession segment facts should collapse before review warnings"
+        );
+    }
+
+    #[test]
+    fn inline_xbrl_segment_aggregate_total_suppresses_component_warning_noise() {
+        let normalizer = Normalizer::new();
+        let period = sample_duration_reporting_period(2017, 2017);
+
+        let mut total = sample_segment_value(
+            SourceType::Html,
+            9070.0,
+            "Capital Segment",
+            "2020 10-K",
+            "0000040545-20-000009",
+        );
+        set_reporting_period(&mut total, period.clone());
+        total.provenance.source_location.section_name = Some("inline_xbrl_segment".to_string());
+        total.provenance.source_location.table_name = Some("inline_xbrl_segment".to_string());
+
+        let mut component_one = sample_segment_value(
+            SourceType::Html,
+            1558.0,
+            "Capital Segment",
+            "2020 10-K",
+            "0000040545-20-000009",
+        );
+        set_reporting_period(&mut component_one, period.clone());
+        component_one.provenance.source_location.section_name =
+            Some("inline_xbrl_segment".to_string());
+        component_one.provenance.source_location.table_name =
+            Some("inline_xbrl_segment".to_string());
+
+        let mut component_two = sample_segment_value(
+            SourceType::Html,
+            7512.0,
+            "Capital Segment",
+            "2020 10-K",
+            "0000040545-20-000009",
+        );
+        set_reporting_period(&mut component_two, period);
+        component_two.provenance.source_location.section_name =
+            Some("inline_xbrl_segment".to_string());
+        component_two.provenance.source_location.table_name =
+            Some("inline_xbrl_segment".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: component_one,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: component_two,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("segment_data.segment_revenue"),
+                    metric_name: "Segment Revenue".to_string(),
+                    domain: DomainName::SegmentData,
+                    subdomain: Some("segment_results".to_string()),
+                    numeric_value: total,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+        let metric = &normalized.numeric_metrics[0];
+
+        assert_eq!(metric.value.amount, 9070.0);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "aggregate total plus inline xbrl component rows should not create duplicate warning noise"
         );
     }
 
