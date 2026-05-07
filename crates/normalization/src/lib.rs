@@ -617,6 +617,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_same_accession_notes_and_bonds_duplicate_issue(metric_id, values) {
+        return true;
+    }
+
     let supports_history_suppression = metric_id.starts_with("segment_data.")
         || metric_id == "debt_and_credit.notes_and_bonds";
     if !supports_history_suppression {
@@ -635,6 +639,23 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
 
     let best_rank_count = ranks.iter().filter(|rank| *rank == best_rank).count();
     best_rank_count == 1
+}
+
+fn suppress_same_accession_notes_and_bonds_duplicate_issue(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if metric_id != "debt_and_credit.notes_and_bonds" || values.len() != 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+
+    values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
 }
 
 fn suppress_segment_inline_xbrl_component_duplicate_issue(
@@ -2065,6 +2086,49 @@ mod tests {
         let normalized = normalizer.normalize(&[], &html_result);
 
         assert_eq!(normalized.numeric_metrics[0].value.amount, 25_371.0);
+    }
+
+    #[test]
+    fn notes_and_bonds_same_accession_pair_stays_in_provenance_without_main_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut smaller = sample_numeric_value(SourceType::Html, 14_762.0);
+        smaller.label = Some("Senior notes".to_string());
+        smaller.provenance.filing_label = Some("Senior notes".to_string());
+        smaller.provenance.source_location.row_label = Some("Senior notes".to_string());
+        smaller.provenance.accession_number = "0000040545-20-000009".to_string();
+
+        let mut larger = smaller.clone();
+        larger.amount = 25_371.0;
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.notes_and_bonds"),
+                    metric_name: "Notes and Bonds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_structure".to_string()),
+                    numeric_value: smaller,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.notes_and_bonds"),
+                    metric_name: "Notes and Bonds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_structure".to_string()),
+                    numeric_value: larger,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "same-accession debt note alternates should remain reviewable in provenance without main warning noise"
+        );
     }
 
     #[test]
