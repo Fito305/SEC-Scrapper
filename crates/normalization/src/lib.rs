@@ -895,7 +895,7 @@ fn segment_inline_xbrl_value_key(value: &NumericValue) -> String {
 }
 
 fn collapse_same_accession_duplicates(domain: DomainName, values: &mut Vec<NumericValue>) {
-    if domain != DomainName::SegmentData || values.len() < 2 {
+    if values.len() < 2 {
         return;
     }
 
@@ -907,8 +907,9 @@ fn collapse_same_accession_duplicates(domain: DomainName, values: &mut Vec<Numer
                 && existing.unit == value.unit
                 && existing.scale == value.scale
                 && existing.reporting_period == value.reporting_period
-                && existing.provenance.source_location.segment_name
-                    == value.provenance.source_location.segment_name
+                && (domain != DomainName::SegmentData
+                    || existing.provenance.source_location.segment_name
+                        == value.provenance.source_location.segment_name)
         });
 
         if !is_duplicate {
@@ -1684,7 +1685,7 @@ mod tests {
         let normalized = normalizer.normalize(&xbrl_metrics, &HtmlExtractionResult::default());
 
         assert_eq!(normalized.numeric_metrics.len(), 1);
-        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 1);
         assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
     }
 
@@ -2314,6 +2315,68 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "repeated identical same-segment amount sets across later filings should remain reviewable in provenance without main warning noise"
+        );
+    }
+
+    #[test]
+    fn identical_same_accession_revenue_values_collapse_before_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut first = sample_numeric_value(SourceType::Html, 28_831.0);
+        first.label = Some("Revenue".to_string());
+        first.provenance.filing_label = Some("Revenue".to_string());
+        first.provenance.source_location.row_label = Some("Revenue".to_string());
+        first.provenance.accession_number = "0000040545-19-000053".to_string();
+        first.provenance.xbrl_tag = Some("us-gaap:Revenues".to_string());
+        set_reporting_period(
+            &mut first,
+            ReportingPeriod {
+                context: PeriodContext::Duration {
+                    start: date!(2019 - 04 - 01),
+                    end: date!(2019 - 06 - 30),
+                },
+                fiscal_period: None,
+                label: None,
+            },
+        );
+
+        let second = first.clone();
+        let third = first.clone();
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.revenue"),
+                    metric_name: "Revenue".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: first,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.revenue"),
+                    metric_name: "Revenue".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: second,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("income_statement.revenue"),
+                    metric_name: "Revenue".to_string(),
+                    domain: DomainName::IncomeStatement,
+                    subdomain: Some("operating_results".to_string()),
+                    numeric_value: third,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 1);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "identical same-accession revenue values should collapse before warning generation"
         );
     }
 
