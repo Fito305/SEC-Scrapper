@@ -347,13 +347,23 @@ impl SecFetchExportWorkflow {
 
             if join_set.len() >= HTML_EXTRACTION_CONCURRENCY {
                 if let Some(batch) = join_set.join_next().await {
-                    merge_html_filing_batch(batch.expect("html extraction task should not panic"), &mut combined, &mut issues, &mut timings);
+                    merge_html_filing_batch(
+                        batch.expect("html extraction task should not panic"),
+                        &mut combined,
+                        &mut issues,
+                        &mut timings,
+                    );
                 }
             }
         }
 
         while let Some(batch) = join_set.join_next().await {
-            merge_html_filing_batch(batch.expect("html extraction task should not panic"), &mut combined, &mut issues, &mut timings);
+            merge_html_filing_batch(
+                batch.expect("html extraction task should not panic"),
+                &mut combined,
+                &mut issues,
+                &mut timings,
+            );
         }
 
         timings = top_slowest_html_timings(timings);
@@ -942,10 +952,8 @@ mod tests {
             },
         ]);
 
-        let accessions = timings
-            .iter()
-            .map(|timing| timing.accession_number.as_str())
-            .collect::<Vec<_>>();
+        let accessions =
+            timings.iter().map(|timing| timing.accession_number.as_str()).collect::<Vec<_>>();
 
         assert_eq!(accessions, vec!["b", "c", "d", "e", "f"]);
     }

@@ -89,6 +89,14 @@ impl ValuationEngine {
     /// `normalized.numeric_metrics` down to `DomainName::SegmentData` and the exact segment names
     /// you want to model. Keeping that work in a separate helper preserves the current
     /// company-level formulas while making the later segment-specific entry point obvious.
+    ///
+    /// Debt detail rows under `DomainName::DebtAndCredit` are also intentionally excluded for now.
+    /// The current placeholders should keep using aggregate debt rows such as `notes_and_bonds`
+    /// or `long_term_debt`. If you later want capital-structure formulas to use bank funding
+    /// detail, add a dedicated selector helper that opts into the exact `detail_*` debt metrics
+    /// you want instead of mixing them into these aggregate placeholders implicitly. That later
+    /// helper should also distinguish between outstanding-style detail rows and flow-style rows
+    /// such as `*_issuance` or `*_maturities`, because those serve different modeling purposes.
     pub fn compute_placeholder_outputs(
         &self,
         normalized: &NormalizationResult,

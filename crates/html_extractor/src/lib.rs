@@ -134,7 +134,8 @@ impl HtmlExtractor {
         let mut extracted = Vec::new();
 
         for table in document.select(&table_selector) {
-            let structured_rows = collect_structured_table_rows(&table, &row_selector, &cell_selector);
+            let structured_rows =
+                collect_structured_table_rows(&table, &row_selector, &cell_selector);
             let table_caption_context =
                 table.select(&caption_selector).next().map(text_content).unwrap_or_default();
             let header_context = infer_table_context(&structured_rows);
@@ -149,7 +150,8 @@ impl HtmlExtractor {
                 .first()
                 .map(|row| row.iter().map(|cell| cell.text.clone()).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let column_periods = table_column_periods(&structured_rows, filing, &bare_annual_context);
+            let column_periods =
+                table_column_periods(&structured_rows, filing, &bare_annual_context);
             let table_context =
                 if !column_periods.is_empty() && table_caption_context.trim().is_empty() {
                     header_context.clone()
@@ -161,8 +163,7 @@ impl HtmlExtractor {
             } else {
                 table_context.clone()
             };
-            let skip_generic_extraction =
-                should_skip_generic_table_extraction(&provenance_context);
+            let skip_generic_extraction = should_skip_generic_table_extraction(&provenance_context);
 
             extracted.extend(self.extract_debt_note_table_metrics(
                 &structured_rows,
@@ -212,6 +213,12 @@ impl HtmlExtractor {
                                 return None;
                             }
                             let (amount, sign_convention) = parse_numeric_cell(numeric_text)?;
+                            if !amount_is_plausible_for_metric(
+                                matched_metric.definition.metric_id.as_str(),
+                                amount,
+                            ) {
+                                return None;
+                            }
                             Some((
                                 column_period.reporting_period.clone(),
                                 amount,
@@ -287,6 +294,12 @@ impl HtmlExtractor {
                 let Some((amount, sign_convention)) = parse_numeric_cell(&numeric_text) else {
                     return Err(HtmlExtractionError::InvalidNumericValue { row_label });
                 };
+                if !amount_is_plausible_for_metric(
+                    matched_metric.definition.metric_id.as_str(),
+                    amount,
+                ) {
+                    continue;
+                }
 
                 let reporting_period = reporting_period_from_filing(filing);
                 let provenance = Provenance {
@@ -781,6 +794,7 @@ impl HtmlExtractor {
         let mut notes_and_bonds_total = 0.0_f64;
         let mut notes_and_bonds_found = false;
         let mut revolver_value = None;
+        let mut detail_funding_rows = Vec::new();
         let mut interest_rate_candidates = Vec::new();
 
         for row in rows.iter().skip(1) {
@@ -801,6 +815,10 @@ impl HtmlExtractor {
                 if is_notes_and_bonds_row(&normalized_row) {
                     notes_and_bonds_total += amount;
                     notes_and_bonds_found = true;
+                }
+
+                if let Some(detail_metric_id) = debt_detail_metric_id(&normalized_row) {
+                    detail_funding_rows.push((detail_metric_id, row_label.clone(), amount));
                 }
 
                 if is_revolver_row(&normalized_row) {
@@ -830,6 +848,19 @@ impl HtmlExtractor {
                     metric,
                     notes_and_bonds_total,
                     "aggregated debt note instruments".to_string(),
+                    filing,
+                    provenance_context,
+                    table_scale,
+                ));
+            }
+        }
+
+        for (metric_id, row_label, amount) in detail_funding_rows {
+            if let Some(metric) = self.registry.by_id(metric_id) {
+                extracted.push(build_debt_note_metric(
+                    metric,
+                    amount,
+                    row_label,
                     filing,
                     provenance_context,
                     table_scale,
@@ -1002,6 +1033,7 @@ fn should_skip_generic_table_extraction(table_context: &str) -> bool {
         || normalized.contains("assets and liabilities measured at fair value on a recurring basis")
         || normalized.contains("derivative netting adjustments")
         || normalized.contains("fair value hierarchy")
+        || normalized.contains("free standing derivative receivables and payables")
 }
 
 fn looks_like_debt_note_table(
@@ -1026,8 +1058,7 @@ fn debt_metric_columns(rows: &[Vec<HtmlTableCell>]) -> Option<(Option<usize>, Op
         for cell in row {
             let normalized = normalize_label(&cell.text);
             if rate_column.is_none()
-                && (normalized.contains("effective interest rate")
-                    || normalized == "interest rate")
+                && (normalized.contains("effective interest rate") || normalized == "interest rate")
             {
                 rate_column = Some(cell.display_column_start);
             }
@@ -1057,6 +1088,90 @@ fn is_notes_and_bonds_row(normalized_row: &str) -> bool {
     normalized_row.contains("note")
         || normalized_row.contains("bond")
         || normalized_row.contains("debenture")
+}
+
+fn debt_detail_metric_id(normalized_row: &str) -> Option<&'static str> {
+    let flow_suffix = if normalized_row.contains("issuance")
+        || normalized_row.contains("issued")
+        || normalized_row.contains("originated")
+        || normalized_row.contains("new borrowings")
+    {
+        Some("issuance")
+    } else if normalized_row.contains("maturit")
+        || normalized_row.contains("redemption")
+        || normalized_row.contains("redeemed")
+        || normalized_row.contains("repayment")
+        || normalized_row.contains("repayments")
+    {
+        Some("maturities")
+    } else {
+        None
+    };
+
+    let base = if normalized_row.contains("structured note") {
+        Some("debt_and_credit.detail_structured_notes")
+    } else if normalized_row.contains("subordinated debt")
+        || normalized_row.contains("subordinated note")
+        || normalized_row.contains("junior subordinated")
+    {
+        Some("debt_and_credit.detail_subordinated_debt")
+    } else if normalized_row.contains("secured borrowing")
+        || normalized_row.contains("secured financing")
+        || normalized_row.contains("asset backed")
+        || normalized_row.contains("asset-backed")
+        || normalized_row.contains("federal home loan bank")
+        || normalized_row.contains("fhlb")
+    {
+        Some("debt_and_credit.detail_secured_borrowings")
+    } else if normalized_row.contains("other borrowed funds")
+        || normalized_row.contains("other borrowings")
+        || normalized_row.contains("borrowed funds")
+    {
+        Some("debt_and_credit.detail_other_borrowed_funds")
+    } else if normalized_row.contains("senior note")
+        || normalized_row.contains("senior unsecured note")
+        || normalized_row.contains("medium term note")
+        || normalized_row.contains("medium-term note")
+    {
+        Some("debt_and_credit.detail_senior_notes")
+    } else {
+        None
+    }?;
+
+    match (base, flow_suffix) {
+        ("debt_and_credit.detail_senior_notes", Some("issuance")) => {
+            Some("debt_and_credit.detail_senior_notes_issuance")
+        }
+        ("debt_and_credit.detail_senior_notes", Some("maturities")) => {
+            Some("debt_and_credit.detail_senior_notes_maturities")
+        }
+        ("debt_and_credit.detail_subordinated_debt", Some("issuance")) => {
+            Some("debt_and_credit.detail_subordinated_debt_issuance")
+        }
+        ("debt_and_credit.detail_subordinated_debt", Some("maturities")) => {
+            Some("debt_and_credit.detail_subordinated_debt_maturities")
+        }
+        ("debt_and_credit.detail_other_borrowed_funds", Some("issuance")) => {
+            Some("debt_and_credit.detail_other_borrowed_funds_issuance")
+        }
+        ("debt_and_credit.detail_other_borrowed_funds", Some("maturities")) => {
+            Some("debt_and_credit.detail_other_borrowed_funds_maturities")
+        }
+        ("debt_and_credit.detail_secured_borrowings", Some("issuance")) => {
+            Some("debt_and_credit.detail_secured_borrowings_issuance")
+        }
+        ("debt_and_credit.detail_secured_borrowings", Some("maturities")) => {
+            Some("debt_and_credit.detail_secured_borrowings_maturities")
+        }
+        ("debt_and_credit.detail_structured_notes", Some("issuance")) => {
+            Some("debt_and_credit.detail_structured_notes_issuance")
+        }
+        ("debt_and_credit.detail_structured_notes", Some("maturities")) => {
+            Some("debt_and_credit.detail_structured_notes_maturities")
+        }
+        (base, None) => Some(base),
+        _ => None,
+    }
 }
 
 fn is_revolver_row(normalized_row: &str) -> bool {
@@ -1094,6 +1209,18 @@ fn interest_rate_priority(normalized_row: &str) -> u8 {
     } else {
         4
     }
+}
+
+fn amount_is_plausible_for_metric(metric_id: &str, amount: f64) -> bool {
+    if metric_id == "debt_and_credit.interest_rate" {
+        // Debt-rate outputs should remain true percentage-like values. If this row is producing a
+        // five-digit amount, the extractor likely read a carrying value or notional amount from
+        // the wrong column/context. Keep the filter narrow here instead of loosening downstream
+        // normalization so future debt-detail work starts from clean rate candidates.
+        return amount.abs() <= 100.0;
+    }
+
+    true
 }
 
 fn looks_like_financial_funding_summary_table(table_context: &str) -> bool {
@@ -1195,22 +1322,21 @@ fn table_column_periods(
     let allow_bare_annual_headers = table_context_supports_bare_annual_headers(table_context);
 
     for row in structured_rows.iter().take(4) {
-        let periods = row
-            .iter()
-            .cloned()
-            .filter_map(|cell| {
-                if is_reference_header(&cell.text) {
-                    return None;
-                }
-                parse_header_reporting_period(&cell.text, filing, allow_bare_annual_headers).map(
-                    |reporting_period| HtmlColumnPeriod {
-                        display_column_start: cell.display_column_start,
-                        display_column_end: cell.display_column_end,
-                        reporting_period,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
+        let periods =
+            row.iter()
+                .cloned()
+                .filter_map(|cell| {
+                    if is_reference_header(&cell.text) {
+                        return None;
+                    }
+                    parse_header_reporting_period(&cell.text, filing, allow_bare_annual_headers)
+                        .map(|reporting_period| HtmlColumnPeriod {
+                            display_column_start: cell.display_column_start,
+                            display_column_end: cell.display_column_end,
+                            reporting_period,
+                        })
+                })
+                .collect::<Vec<_>>();
 
         if periods.len() > best_match.len() {
             best_match = periods;
@@ -1247,10 +1373,7 @@ fn collect_structured_table_rows(
     row_selector: &Selector,
     cell_selector: &Selector,
 ) -> Vec<Vec<HtmlTableCell>> {
-    table
-        .select(row_selector)
-        .map(|row| structured_row_cells(&row, cell_selector))
-        .collect()
+    table.select(row_selector).map(|row| structured_row_cells(&row, cell_selector)).collect()
 }
 
 fn select_numeric_cell_in_period_span<'a>(
@@ -1962,10 +2085,7 @@ fn inline_xbrl_core_contexts(
             continue;
         }
 
-        contexts.insert(
-            context_id.to_string(),
-            reporting_period_from_inline_context_body(body),
-        );
+        contexts.insert(context_id.to_string(), reporting_period_from_inline_context_body(body));
         search_start = context_end + "</xbrli:context>".len();
     }
 
@@ -2381,10 +2501,7 @@ mod tests {
         let table_selector = selector("table");
         let row_selector = selector("tr");
         let cell_selector = selector("th, td");
-        let table = document
-            .select(&table_selector)
-            .next()
-            .expect("table should exist");
+        let table = document.select(&table_selector).next().expect("table should exist");
 
         let rows = collect_structured_table_rows(&table, &row_selector, &cell_selector);
 
@@ -3454,6 +3571,138 @@ mod tests {
     }
 
     #[test]
+    fn extracts_debt_detail_metrics_from_clearly_labeled_note_rows() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Long-Term Debt and Other Borrowed Funds</caption>
+                  <tr>
+                    <th>Description</th>
+                    <th>Effective Interest Rate / 2024</th>
+                    <th>Carrying Value / 2024</th>
+                  </tr>
+                  <tr>
+                    <th>Senior unsecured notes</th>
+                    <td>4.20%</td>
+                    <td>800</td>
+                  </tr>
+                  <tr>
+                    <th>Junior subordinated notes</th>
+                    <td>5.10%</td>
+                    <td>250</td>
+                  </tr>
+                  <tr>
+                    <th>Other borrowed funds</th>
+                    <td>3.75%</td>
+                    <td>175</td>
+                  </tr>
+                  <tr>
+                    <th>Structured notes</th>
+                    <td>6.00%</td>
+                    <td>90</td>
+                  </tr>
+                  <tr>
+                    <th>Asset-backed secured borrowings</th>
+                    <td>4.90%</td>
+                    <td>60</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        let senior_notes = extracted
+            .iter()
+            .find(|metric| metric.metric_id.as_str() == "debt_and_credit.detail_senior_notes");
+        let subordinated_debt = extracted
+            .iter()
+            .find(|metric| metric.metric_id.as_str() == "debt_and_credit.detail_subordinated_debt");
+        let other_borrowed_funds = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_other_borrowed_funds"
+        });
+        let structured_notes = extracted
+            .iter()
+            .find(|metric| metric.metric_id.as_str() == "debt_and_credit.detail_structured_notes");
+        let secured_borrowings = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_secured_borrowings"
+        });
+        let aggregate_notes = extracted
+            .iter()
+            .find(|metric| metric.metric_id.as_str() == "debt_and_credit.notes_and_bonds");
+
+        assert_eq!(senior_notes.map(|metric| metric.numeric_value.amount), Some(800.0));
+        assert_eq!(subordinated_debt.map(|metric| metric.numeric_value.amount), Some(250.0));
+        assert_eq!(other_borrowed_funds.map(|metric| metric.numeric_value.amount), Some(175.0));
+        assert_eq!(structured_notes.map(|metric| metric.numeric_value.amount), Some(90.0));
+        assert_eq!(secured_borrowings.map(|metric| metric.numeric_value.amount), Some(60.0));
+        assert_eq!(aggregate_notes.map(|metric| metric.numeric_value.amount), Some(1_140.0));
+    }
+
+    #[test]
+    fn extracts_debt_detail_flow_metrics_from_issuance_and_maturity_rows() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Long-Term Unsecured Funding</caption>
+                  <tr>
+                    <th>Description</th>
+                    <th>Carrying Value / 2024</th>
+                  </tr>
+                  <tr>
+                    <th>Senior notes issuance</th>
+                    <td>325</td>
+                  </tr>
+                  <tr>
+                    <th>Senior notes maturities and redemptions</th>
+                    <td>140</td>
+                  </tr>
+                  <tr>
+                    <th>Other borrowed funds issuance</th>
+                    <td>80</td>
+                  </tr>
+                  <tr>
+                    <th>Other borrowed funds repayments</th>
+                    <td>35</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        let senior_issuance = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_senior_notes_issuance"
+        });
+        let senior_maturities = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_senior_notes_maturities"
+        });
+        let other_issuance = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_other_borrowed_funds_issuance"
+        });
+        let other_maturities = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_other_borrowed_funds_maturities"
+        });
+
+        assert_eq!(senior_issuance.map(|metric| metric.numeric_value.amount), Some(325.0));
+        assert_eq!(senior_maturities.map(|metric| metric.numeric_value.amount), Some(140.0));
+        assert_eq!(other_issuance.map(|metric| metric.numeric_value.amount), Some(80.0));
+        assert_eq!(other_maturities.map(|metric| metric.numeric_value.amount), Some(35.0));
+    }
+
+    #[test]
     fn extracts_debt_metrics_from_no_caption_tables_when_debt_columns_are_present() {
         let extractor = HtmlExtractor::default();
         let filing = sample_filing();
@@ -3525,6 +3774,72 @@ mod tests {
                 .iter()
                 .all(|metric| metric.metric_id.as_str() != "balance_sheet.long_term_debt")
         );
+        assert!(
+            extracted
+                .iter()
+                .all(|metric| metric.metric_id.as_str() != "debt_and_credit.interest_rate")
+        );
+    }
+
+    #[test]
+    fn rejects_interest_rate_from_free_standing_derivative_tables() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Free-standing derivative receivables and payables (a)</caption>
+                  <tr>
+                    <th>Interest rate</th>
+                    <th>2024</th>
+                  </tr>
+                  <tr>
+                    <th>Interest rate</th>
+                    <td>546625</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        assert!(
+            extracted
+                .iter()
+                .all(|metric| metric.metric_id.as_str() != "debt_and_credit.interest_rate")
+        );
+    }
+
+    #[test]
+    fn rejects_implausibly_large_interest_rate_values_in_generic_tables() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Long-Term Debt Summary</caption>
+                  <tr>
+                    <th>Description</th>
+                    <th>2024</th>
+                  </tr>
+                  <tr>
+                    <th>Interest rate</th>
+                    <td>26429</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
         assert!(
             extracted
                 .iter()

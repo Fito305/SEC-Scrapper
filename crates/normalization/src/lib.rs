@@ -637,16 +637,13 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
-    let supports_history_suppression = metric_id.starts_with("segment_data.")
-        || metric_id == "debt_and_credit.notes_and_bonds";
+    let supports_history_suppression =
+        metric_id.starts_with("segment_data.") || metric_id == "debt_and_credit.notes_and_bonds";
     if !supports_history_suppression {
         return false;
     }
 
-    let mut ranks = values
-        .iter()
-        .map(|value| history_rank(metric_id, value))
-        .collect::<Vec<_>>();
+    let mut ranks = values.iter().map(|value| history_rank(metric_id, value)).collect::<Vec<_>>();
     ranks.sort();
 
     let Some(best_rank) = ranks.first() else {
@@ -685,10 +682,7 @@ fn suppress_repeated_segment_value_sets_across_filings(
     let mut by_accession: std::collections::BTreeMap<&str, Vec<&NumericValue>> =
         std::collections::BTreeMap::new();
     for value in values {
-        by_accession
-            .entry(value.provenance.accession_number.as_str())
-            .or_default()
-            .push(value);
+        by_accession.entry(value.provenance.accession_number.as_str()).or_default().push(value);
     }
 
     if by_accession.len() < 2 {
@@ -706,10 +700,7 @@ fn suppress_repeated_segment_value_sets_across_filings(
 
     patterns.dedup_by(|left, right| {
         left.len() == right.len()
-            && left
-                .iter()
-                .zip(right.iter())
-                .all(|(l, r)| !amounts_differ(*l, *r))
+            && left.iter().zip(right.iter()).all(|(l, r)| !amounts_differ(*l, *r))
     });
 
     patterns.len() == 1
@@ -733,10 +724,8 @@ fn suppress_same_accession_revenue_inline_xbrl_pair(
         return false;
     }
 
-    let tagged_count = values
-        .iter()
-        .filter(|value| value.provenance.xbrl_tag.as_deref().is_some())
-        .count();
+    let tagged_count =
+        values.iter().filter(|value| value.provenance.xbrl_tag.as_deref().is_some()).count();
     tagged_count == 1
 }
 
@@ -822,8 +811,7 @@ fn promote_segment_inline_xbrl_aggregate_totals(metric_id: &str, values: &mut [N
 
     values.sort_by(|left, right| {
         let left_rank = u8::from(!aggregate_keys.contains(&segment_inline_xbrl_value_key(left)));
-        let right_rank =
-            u8::from(!aggregate_keys.contains(&segment_inline_xbrl_value_key(right)));
+        let right_rank = u8::from(!aggregate_keys.contains(&segment_inline_xbrl_value_key(right)));
 
         left_rank
             .cmp(&right_rank)
@@ -838,7 +826,8 @@ fn prefer_same_accession_notes_and_bonds_total(metric_id: &str, values: &mut [Nu
     }
 
     values.sort_by(|left, right| {
-        let accession_cmp = left.provenance.accession_number.cmp(&right.provenance.accession_number);
+        let accession_cmp =
+            left.provenance.accession_number.cmp(&right.provenance.accession_number);
         if accession_cmp != std::cmp::Ordering::Equal {
             return history_rank(metric_id, left).cmp(&history_rank(metric_id, right));
         }
@@ -890,10 +879,7 @@ fn segment_inline_xbrl_aggregate_keys(
         if !is_inline_xbrl_segment_value(value) {
             continue;
         }
-        groups
-            .entry(value.provenance.accession_number.clone())
-            .or_default()
-            .push(value);
+        groups.entry(value.provenance.accession_number.clone()).or_default().push(value);
     }
 
     let mut aggregate_keys = std::collections::BTreeSet::new();
@@ -924,11 +910,7 @@ fn segment_inline_xbrl_aggregate_total<'a>(
     }
 
     let component_sum = components.iter().map(|value| value.amount).sum::<f64>();
-    if !amounts_differ(total.amount, component_sum) {
-        Some(total)
-    } else {
-        None
-    }
+    if !amounts_differ(total.amount, component_sum) { Some(total) } else { None }
 }
 
 fn is_inline_xbrl_segment_value(value: &NumericValue) -> bool {
@@ -941,11 +923,7 @@ fn segment_inline_xbrl_value_key(value: &NumericValue) -> String {
         "{}::{}::{}::{}",
         value.provenance.accession_number,
         normalized_period_key(&value.reporting_period),
-        value.provenance
-            .source_location
-            .segment_name
-            .as_deref()
-            .unwrap_or_default(),
+        value.provenance.source_location.segment_name.as_deref().unwrap_or_default(),
         value.amount
     )
 }
@@ -1246,8 +1224,7 @@ fn prune_cost_of_goods_sold_context_mismatches(values: &mut Vec<NumericValue>) {
     }
 
     let has_three_month_candidate = values.iter().any(|value| {
-        context_contains(value, "three months ended")
-            && !context_contains(value, "(continued)")
+        context_contains(value, "three months ended") && !context_contains(value, "(continued)")
     });
     if has_three_month_candidate {
         values.retain(|value| {
@@ -2506,9 +2483,7 @@ mod tests {
         set_reporting_period(
             &mut dominant,
             ReportingPeriod {
-                context: PeriodContext::Instant {
-                    as_of: date!(2024 - 12 - 31),
-                },
+                context: PeriodContext::Instant { as_of: date!(2024 - 12 - 31) },
                 fiscal_period: None,
                 label: None,
             },
@@ -2568,10 +2543,8 @@ mod tests {
             Some("Assets and liabilities measured at fair value on a recurring basis".to_string());
         fair_value_value.provenance.source_location.section_name =
             Some("Assets and liabilities measured at fair value on a recurring basis".to_string());
-        fair_value_value.provenance.source_location.table_name =
-            Some("Long-term debt".to_string());
-        fair_value_value.provenance.source_location.row_label =
-            Some("Long-term debt".to_string());
+        fair_value_value.provenance.source_location.table_name = Some("Long-term debt".to_string());
+        fair_value_value.provenance.source_location.row_label = Some("Long-term debt".to_string());
 
         let html_result = HtmlExtractionResult {
             numeric_fallbacks: vec![
@@ -2597,12 +2570,7 @@ mod tests {
 
         assert_eq!(normalized.numeric_metrics[0].value.amount, 292224.0);
         assert_eq!(
-            normalized.numeric_metrics[0]
-                .value
-                .provenance
-                .source_location
-                .section_name
-                .as_deref(),
+            normalized.numeric_metrics[0].value.provenance.source_location.section_name.as_deref(),
             Some("Selected Consolidated balance sheets data")
         );
     }
