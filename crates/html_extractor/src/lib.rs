@@ -171,6 +171,13 @@ impl HtmlExtractor {
                 &provenance_context,
                 table_scale,
             ));
+            extracted.extend(self.extract_funding_flow_table_metrics(
+                &structured_rows,
+                &header_cells,
+                filing,
+                &provenance_context,
+                table_scale,
+            ));
 
             if skip_generic_extraction {
                 continue;
@@ -898,6 +905,77 @@ impl HtmlExtractor {
         extracted
     }
 
+    fn extract_funding_flow_table_metrics(
+        &self,
+        rows: &[Vec<HtmlTableCell>],
+        header_cells: &[String],
+        filing: &FilingMetadata,
+        provenance_context: &str,
+        table_scale: ValueScale,
+    ) -> Vec<ExtractedHtmlMetricValue> {
+        let normalized_context = normalize_label(provenance_context);
+        let is_unsecured_funding = normalized_context.contains("long term unsecured funding");
+        if !is_unsecured_funding {
+            return Vec::new();
+        }
+
+        let mut extracted = Vec::new();
+        let mut current_flow: Option<&'static str> = None;
+
+        for row in rows {
+            let cells: Vec<String> = row.iter().map(|cell| cell.text.clone()).collect();
+            if cells.len() < 2 {
+                continue;
+            }
+
+            let row_label = cells[0].trim().to_string();
+            let normalized_row = normalize_label(&row_label);
+            if normalized_row.is_empty() {
+                continue;
+            }
+
+            if normalized_row == "issuance" {
+                current_flow = Some("issuance");
+                continue;
+            }
+            if normalized_row.contains("maturities") || normalized_row.contains("redemptions") {
+                current_flow = Some("maturities");
+                continue;
+            }
+
+            let Some(base_metric_id) = debt_detail_base_metric_id(&normalized_row) else {
+                continue;
+            };
+            let Some(flow) = current_flow else {
+                continue;
+            };
+            let metric_id = debt_detail_flow_metric_id(base_metric_id, flow);
+            let Some(metric_id) = metric_id else {
+                continue;
+            };
+            let Some(numeric_text) = select_numeric_cell_for_filing(&cells, header_cells, filing)
+            else {
+                continue;
+            };
+            let Some((amount, _)) = parse_numeric_cell(&numeric_text) else {
+                continue;
+            };
+            let Some(metric) = self.registry.by_id(metric_id) else {
+                continue;
+            };
+            extracted.push(build_debt_note_metric(
+                metric,
+                amount,
+                row_label,
+                filing,
+                provenance_context,
+                table_scale,
+            ));
+        }
+
+        extracted
+    }
+
     fn extract_narrative_sections_from_document(
         &self,
         document: &Html,
@@ -1090,6 +1168,76 @@ fn is_notes_and_bonds_row(normalized_row: &str) -> bool {
         || normalized_row.contains("debenture")
 }
 
+fn debt_detail_base_metric_id(normalized_row: &str) -> Option<&'static str> {
+    if normalized_row.contains("structured note") {
+        Some("debt_and_credit.detail_structured_notes")
+    } else if normalized_row.contains("subordinated debt")
+        || normalized_row.contains("subordinated note")
+        || normalized_row.contains("junior subordinated")
+        || normalized_row == "subordinated"
+    {
+        Some("debt_and_credit.detail_subordinated_debt")
+    } else if normalized_row.contains("secured borrowing")
+        || normalized_row.contains("secured financing")
+        || normalized_row.contains("asset backed")
+        || normalized_row.contains("asset-backed")
+        || normalized_row.contains("federal home loan bank")
+        || normalized_row.contains("fhlb")
+        || normalized_row.contains("credit card securitization")
+    {
+        Some("debt_and_credit.detail_secured_borrowings")
+    } else if normalized_row.contains("other borrowed funds")
+        || normalized_row.contains("other borrowings")
+        || normalized_row.contains("borrowed funds")
+    {
+        Some("debt_and_credit.detail_other_borrowed_funds")
+    } else if normalized_row.contains("senior note")
+        || normalized_row.contains("senior unsecured note")
+        || normalized_row.contains("medium term note")
+        || normalized_row.contains("medium-term note")
+    {
+        Some("debt_and_credit.detail_senior_notes")
+    } else {
+        None
+    }
+}
+
+fn debt_detail_flow_metric_id(base: &str, flow: &str) -> Option<&'static str> {
+    match (base, flow) {
+        ("debt_and_credit.detail_senior_notes", "issuance") => {
+            Some("debt_and_credit.detail_senior_notes_issuance")
+        }
+        ("debt_and_credit.detail_senior_notes", "maturities") => {
+            Some("debt_and_credit.detail_senior_notes_maturities")
+        }
+        ("debt_and_credit.detail_subordinated_debt", "issuance") => {
+            Some("debt_and_credit.detail_subordinated_debt_issuance")
+        }
+        ("debt_and_credit.detail_subordinated_debt", "maturities") => {
+            Some("debt_and_credit.detail_subordinated_debt_maturities")
+        }
+        ("debt_and_credit.detail_other_borrowed_funds", "issuance") => {
+            Some("debt_and_credit.detail_other_borrowed_funds_issuance")
+        }
+        ("debt_and_credit.detail_other_borrowed_funds", "maturities") => {
+            Some("debt_and_credit.detail_other_borrowed_funds_maturities")
+        }
+        ("debt_and_credit.detail_secured_borrowings", "issuance") => {
+            Some("debt_and_credit.detail_secured_borrowings_issuance")
+        }
+        ("debt_and_credit.detail_secured_borrowings", "maturities") => {
+            Some("debt_and_credit.detail_secured_borrowings_maturities")
+        }
+        ("debt_and_credit.detail_structured_notes", "issuance") => {
+            Some("debt_and_credit.detail_structured_notes_issuance")
+        }
+        ("debt_and_credit.detail_structured_notes", "maturities") => {
+            Some("debt_and_credit.detail_structured_notes_maturities")
+        }
+        _ => None,
+    }
+}
+
 fn debt_detail_metric_id(normalized_row: &str) -> Option<&'static str> {
     let flow_suffix = if normalized_row.contains("issuance")
         || normalized_row.contains("issued")
@@ -1108,67 +1256,11 @@ fn debt_detail_metric_id(normalized_row: &str) -> Option<&'static str> {
         None
     };
 
-    let base = if normalized_row.contains("structured note") {
-        Some("debt_and_credit.detail_structured_notes")
-    } else if normalized_row.contains("subordinated debt")
-        || normalized_row.contains("subordinated note")
-        || normalized_row.contains("junior subordinated")
-    {
-        Some("debt_and_credit.detail_subordinated_debt")
-    } else if normalized_row.contains("secured borrowing")
-        || normalized_row.contains("secured financing")
-        || normalized_row.contains("asset backed")
-        || normalized_row.contains("asset-backed")
-        || normalized_row.contains("federal home loan bank")
-        || normalized_row.contains("fhlb")
-    {
-        Some("debt_and_credit.detail_secured_borrowings")
-    } else if normalized_row.contains("other borrowed funds")
-        || normalized_row.contains("other borrowings")
-        || normalized_row.contains("borrowed funds")
-    {
-        Some("debt_and_credit.detail_other_borrowed_funds")
-    } else if normalized_row.contains("senior note")
-        || normalized_row.contains("senior unsecured note")
-        || normalized_row.contains("medium term note")
-        || normalized_row.contains("medium-term note")
-    {
-        Some("debt_and_credit.detail_senior_notes")
-    } else {
-        None
-    }?;
+    let base = debt_detail_base_metric_id(normalized_row)?;
 
     match (base, flow_suffix) {
-        ("debt_and_credit.detail_senior_notes", Some("issuance")) => {
-            Some("debt_and_credit.detail_senior_notes_issuance")
-        }
-        ("debt_and_credit.detail_senior_notes", Some("maturities")) => {
-            Some("debt_and_credit.detail_senior_notes_maturities")
-        }
-        ("debt_and_credit.detail_subordinated_debt", Some("issuance")) => {
-            Some("debt_and_credit.detail_subordinated_debt_issuance")
-        }
-        ("debt_and_credit.detail_subordinated_debt", Some("maturities")) => {
-            Some("debt_and_credit.detail_subordinated_debt_maturities")
-        }
-        ("debt_and_credit.detail_other_borrowed_funds", Some("issuance")) => {
-            Some("debt_and_credit.detail_other_borrowed_funds_issuance")
-        }
-        ("debt_and_credit.detail_other_borrowed_funds", Some("maturities")) => {
-            Some("debt_and_credit.detail_other_borrowed_funds_maturities")
-        }
-        ("debt_and_credit.detail_secured_borrowings", Some("issuance")) => {
-            Some("debt_and_credit.detail_secured_borrowings_issuance")
-        }
-        ("debt_and_credit.detail_secured_borrowings", Some("maturities")) => {
-            Some("debt_and_credit.detail_secured_borrowings_maturities")
-        }
-        ("debt_and_credit.detail_structured_notes", Some("issuance")) => {
-            Some("debt_and_credit.detail_structured_notes_issuance")
-        }
-        ("debt_and_credit.detail_structured_notes", Some("maturities")) => {
-            Some("debt_and_credit.detail_structured_notes_maturities")
-        }
+        (base, Some("issuance")) => debt_detail_flow_metric_id(base, "issuance"),
+        (base, Some("maturities")) => debt_detail_flow_metric_id(base, "maturities"),
         (base, None) => Some(base),
         _ => None,
     }
@@ -3700,6 +3792,78 @@ mod tests {
         assert_eq!(senior_maturities.map(|metric| metric.numeric_value.amount), Some(140.0));
         assert_eq!(other_issuance.map(|metric| metric.numeric_value.amount), Some(80.0));
         assert_eq!(other_maturities.map(|metric| metric.numeric_value.amount), Some(35.0));
+    }
+
+    #[test]
+    fn extracts_unsecured_funding_flow_metrics_from_section_style_table() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Long-term unsecured funding</caption>
+                  <tr>
+                    <th>Year ended December 31,</th>
+                    <th>2024</th>
+                    <th>2023</th>
+                  </tr>
+                  <tr>
+                    <th>Issuance</th>
+                    <td></td>
+                    <td></td>
+                  </tr>
+                  <tr>
+                    <th>Senior notes</th>
+                    <td>900</td>
+                    <td>700</td>
+                  </tr>
+                  <tr>
+                    <th>Subordinated</th>
+                    <td>150</td>
+                    <td>125</td>
+                  </tr>
+                  <tr>
+                    <th>Maturities/redemptions</th>
+                    <td></td>
+                    <td></td>
+                  </tr>
+                  <tr>
+                    <th>Senior notes</th>
+                    <td>420</td>
+                    <td>390</td>
+                  </tr>
+                  <tr>
+                    <th>Subordinated</th>
+                    <td>80</td>
+                    <td>60</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        let senior_issuance = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_senior_notes_issuance"
+        });
+        let subordinated_issuance = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_subordinated_debt_issuance"
+        });
+        let senior_maturities = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_senior_notes_maturities"
+        });
+        let subordinated_maturities = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_subordinated_debt_maturities"
+        });
+
+        assert_eq!(senior_issuance.map(|metric| metric.numeric_value.amount), Some(900.0));
+        assert_eq!(subordinated_issuance.map(|metric| metric.numeric_value.amount), Some(150.0));
+        assert_eq!(senior_maturities.map(|metric| metric.numeric_value.amount), Some(420.0));
+        assert_eq!(subordinated_maturities.map(|metric| metric.numeric_value.amount), Some(80.0));
     }
 
     #[test]

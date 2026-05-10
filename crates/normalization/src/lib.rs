@@ -367,6 +367,7 @@ fn normalize_numeric_metric(
     rank_source_values(&candidates.metric_id, &mut candidates.html);
     promote_segment_inline_xbrl_aggregate_totals(&candidates.metric_id, &mut candidates.html);
     prefer_same_accession_notes_and_bonds_total(&candidates.metric_id, &mut candidates.html);
+    prefer_same_accession_debt_detail_total(&candidates.metric_id, &mut candidates.html);
     prune_metric_specific_history_duplicates(&candidates.metric_id, &mut candidates.html);
     collapse_same_accession_duplicates(candidates.domain, &mut candidates.xbrl);
     collapse_same_accession_duplicates(candidates.domain, &mut candidates.html);
@@ -637,6 +638,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_same_accession_debt_detail_total_duplicate_issue(metric_id, values) {
+        return true;
+    }
+
     let supports_history_suppression =
         metric_id.starts_with("segment_data.") || metric_id == "debt_and_credit.notes_and_bonds";
     if !supports_history_suppression {
@@ -769,6 +774,38 @@ fn suppress_same_accession_notes_and_bonds_duplicate_issue(
         .all(|value| value.provenance.accession_number == first.provenance.accession_number)
 }
 
+fn suppress_same_accession_debt_detail_total_duplicate_issue(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if !metric_id.starts_with("debt_and_credit.detail_") || values.len() < 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return false;
+    }
+
+    values.iter().any(|value| {
+        let label = value
+            .provenance
+            .source_location
+            .row_label
+            .as_deref()
+            .or(value.label.as_deref())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        label.starts_with("total ")
+    })
+}
+
 fn suppress_segment_inline_xbrl_component_duplicate_issue(
     metric_id: &str,
     values: &[NumericValue],
@@ -844,6 +881,45 @@ fn prefer_same_accession_notes_and_bonds_total(metric_id: &str, values: &mut [Nu
                     .unwrap_or_default()
                     .cmp(right.provenance.filing_label.as_deref().unwrap_or_default())
             })
+    });
+}
+
+fn prefer_same_accession_debt_detail_total(metric_id: &str, values: &mut [NumericValue]) {
+    if !metric_id.starts_with("debt_and_credit.detail_") || values.len() < 2 {
+        return;
+    }
+
+    let Some(first) = values.first() else {
+        return;
+    };
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return;
+    }
+
+    values.sort_by(|left, right| {
+        let left_total = left
+            .provenance
+            .source_location
+            .row_label
+            .as_deref()
+            .or(left.label.as_deref())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .starts_with("total ");
+        let right_total = right
+            .provenance
+            .source_location
+            .row_label
+            .as_deref()
+            .or(right.label.as_deref())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .starts_with("total ");
+
+        right_total.cmp(&left_total).then_with(|| right.amount.total_cmp(&left.amount))
     });
 }
 
@@ -2228,6 +2304,70 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "same-accession debt note alternates should remain reviewable in provenance without main warning noise"
+        );
+    }
+
+    #[test]
+    fn debt_detail_total_and_component_rows_stay_in_provenance_without_main_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut total = sample_numeric_value(SourceType::Html, 23_502.0);
+        total.label = Some("Total senior notes".to_string());
+        total.provenance.filing_label = Some("Total senior notes".to_string());
+        total.provenance.source_location.row_label = Some("Total senior notes".to_string());
+        total.provenance.accession_number = "0000019617-18-000057".to_string();
+
+        let mut us_market = total.clone();
+        us_market.amount = 12_000.0;
+        us_market.label = Some("Senior notes issued in the U.S. market".to_string());
+        us_market.provenance.filing_label =
+            Some("Senior notes issued in the U.S. market".to_string());
+        us_market.provenance.source_location.row_label =
+            Some("Senior notes issued in the U.S. market".to_string());
+
+        let mut non_us_market = total.clone();
+        non_us_market.amount = 11_502.0;
+        non_us_market.label = Some("Senior notes issued in non-U.S. markets".to_string());
+        non_us_market.provenance.filing_label =
+            Some("Senior notes issued in non-U.S. markets".to_string());
+        non_us_market.provenance.source_location.row_label =
+            Some("Senior notes issued in non-U.S. markets".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.detail_senior_notes_issuance"),
+                    metric_name: "Senior Notes Issuance".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_flow_detail".to_string()),
+                    numeric_value: total,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.detail_senior_notes_issuance"),
+                    metric_name: "Senior Notes Issuance".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_flow_detail".to_string()),
+                    numeric_value: us_market,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.detail_senior_notes_issuance"),
+                    metric_name: "Senior Notes Issuance".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_flow_detail".to_string()),
+                    numeric_value: non_us_market,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 23_502.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 3);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "same-accession debt-detail total/component rows should stay reviewable in provenance without main warning noise"
         );
     }
 
