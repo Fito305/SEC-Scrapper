@@ -178,6 +178,13 @@ impl HtmlExtractor {
                 &provenance_context,
                 table_scale,
             ));
+            extracted.extend(self.extract_funding_balance_table_metrics(
+                &structured_rows,
+                &header_cells,
+                filing,
+                &provenance_context,
+                table_scale,
+            ));
 
             if skip_generic_extraction {
                 continue;
@@ -915,8 +922,19 @@ impl HtmlExtractor {
     ) -> Vec<ExtractedHtmlMetricValue> {
         let normalized_context = normalize_label(provenance_context);
         let is_unsecured_funding = normalized_context.contains("long term unsecured funding");
-        if !is_unsecured_funding {
+        let is_secured_funding = normalized_context.contains("long term secured funding");
+        let is_supported_funding_flow = is_unsecured_funding || is_secured_funding;
+        if !is_supported_funding_flow {
             return Vec::new();
+        }
+
+        if is_secured_funding {
+            return self.extract_secured_funding_flow_table_metrics(
+                rows,
+                filing,
+                provenance_context,
+                table_scale,
+            );
         }
 
         let mut extracted = Vec::new();
@@ -953,6 +971,133 @@ impl HtmlExtractor {
             let Some(metric_id) = metric_id else {
                 continue;
             };
+            let Some(numeric_text) = select_numeric_cell_for_filing(&cells, header_cells, filing)
+            else {
+                continue;
+            };
+            let Some((amount, _)) = parse_numeric_cell(&numeric_text) else {
+                continue;
+            };
+            let Some(metric) = self.registry.by_id(metric_id) else {
+                continue;
+            };
+            extracted.push(build_debt_note_metric(
+                metric,
+                amount,
+                row_label,
+                filing,
+                provenance_context,
+                table_scale,
+            ));
+        }
+
+        extracted
+    }
+
+    fn extract_secured_funding_flow_table_metrics(
+        &self,
+        rows: &[Vec<HtmlTableCell>],
+        filing: &FilingMetadata,
+        provenance_context: &str,
+        table_scale: ValueScale,
+    ) -> Vec<ExtractedHtmlMetricValue> {
+        let Some((issuance_column, maturities_column)) = funding_flow_columns(rows) else {
+            return Vec::new();
+        };
+
+        let mut extracted = Vec::new();
+        for row in rows.iter().skip(1) {
+            if row.len() < 2 {
+                continue;
+            }
+
+            let row_label = row[0].text.trim().to_string();
+            let normalized_row = normalize_label(&row_label);
+            if normalized_row.is_empty() {
+                continue;
+            }
+
+            let Some(base_metric_id) = debt_detail_base_metric_id(&normalized_row) else {
+                continue;
+            };
+            if base_metric_id != "debt_and_credit.detail_secured_borrowings" {
+                continue;
+            }
+
+            let issuance_amount = issuance_column
+                .and_then(|column| row_cell_in_display_column(row, column))
+                .and_then(|cell| parse_numeric_cell(&cell.text).map(|(amount, _)| amount));
+            let maturities_amount = maturities_column
+                .and_then(|column| row_cell_in_display_column(row, column))
+                .and_then(|cell| parse_numeric_cell(&cell.text).map(|(amount, _)| amount));
+
+            if let Some(amount) = issuance_amount {
+                if let Some(metric) =
+                    self.registry.by_id("debt_and_credit.detail_secured_borrowings_issuance")
+                {
+                    extracted.push(build_debt_note_metric(
+                        metric,
+                        amount,
+                        row_label.clone(),
+                        filing,
+                        provenance_context,
+                        table_scale,
+                    ));
+                }
+            }
+
+            if let Some(amount) = maturities_amount {
+                if let Some(metric) =
+                    self.registry.by_id("debt_and_credit.detail_secured_borrowings_maturities")
+                {
+                    extracted.push(build_debt_note_metric(
+                        metric,
+                        amount,
+                        row_label.clone(),
+                        filing,
+                        provenance_context,
+                        table_scale,
+                    ));
+                }
+            }
+        }
+
+        extracted
+    }
+
+    fn extract_funding_balance_table_metrics(
+        &self,
+        rows: &[Vec<HtmlTableCell>],
+        header_cells: &[String],
+        filing: &FilingMetadata,
+        provenance_context: &str,
+        table_scale: ValueScale,
+    ) -> Vec<ExtractedHtmlMetricValue> {
+        let normalized_context = normalize_label(provenance_context);
+        if !normalized_context.contains("short term unsecured funding") {
+            return Vec::new();
+        }
+
+        let mut extracted = Vec::new();
+        for row in rows {
+            let cells: Vec<String> = row.iter().map(|cell| cell.text.clone()).collect();
+            if cells.len() < 2 {
+                continue;
+            }
+
+            let row_label = cells[0].trim().to_string();
+            let normalized_row = normalize_label(&row_label);
+            if normalized_row.is_empty() {
+                continue;
+            }
+
+            let Some(metric_id) = debt_detail_base_metric_id(&normalized_row) else {
+                continue;
+            };
+            if metric_id != "debt_and_credit.detail_other_borrowed_funds" {
+                continue;
+            }
+
             let Some(numeric_text) = select_numeric_cell_for_filing(&cells, header_cells, filing)
             else {
                 continue;
@@ -1150,6 +1295,31 @@ fn debt_metric_columns(rows: &[Vec<HtmlTableCell>]) -> Option<(Option<usize>, Op
         None
     } else {
         Some((rate_column, carrying_value_column))
+    }
+}
+
+fn funding_flow_columns(rows: &[Vec<HtmlTableCell>]) -> Option<(Option<usize>, Option<usize>)> {
+    let mut issuance_column = None;
+    let mut maturities_column = None;
+
+    for row in rows.iter().take(3) {
+        for cell in row {
+            let normalized = normalize_label(&cell.text);
+            if issuance_column.is_none() && normalized.contains("issuance") {
+                issuance_column = Some(cell.display_column_start);
+            }
+            if maturities_column.is_none()
+                && (normalized.contains("maturities") || normalized.contains("redemptions"))
+            {
+                maturities_column = Some(cell.display_column_start);
+            }
+        }
+    }
+
+    if issuance_column.is_none() && maturities_column.is_none() {
+        None
+    } else {
+        Some((issuance_column, maturities_column))
     }
 }
 
@@ -3864,6 +4034,85 @@ mod tests {
         assert_eq!(subordinated_issuance.map(|metric| metric.numeric_value.amount), Some(150.0));
         assert_eq!(senior_maturities.map(|metric| metric.numeric_value.amount), Some(420.0));
         assert_eq!(subordinated_maturities.map(|metric| metric.numeric_value.amount), Some(80.0));
+    }
+
+    #[test]
+    fn extracts_secured_funding_flow_metrics_from_section_style_table() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Long-term secured funding</caption>
+                  <tr>
+                    <th>Year ended December 31,</th>
+                    <th>Issuance 2024</th>
+                    <th>Maturities/Redemptions 2024</th>
+                  </tr>
+                  <tr>
+                    <th>Credit card securitization</th>
+                    <td>1396</td>
+                    <td>1590</td>
+                  </tr>
+                  <tr>
+                    <th>FHLB advances</th>
+                    <td>2200</td>
+                    <td>1800</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        let secured_issuance = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_secured_borrowings_issuance"
+        });
+        let secured_maturities = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_secured_borrowings_maturities"
+        });
+
+        assert_eq!(secured_issuance.map(|metric| metric.numeric_value.amount), Some(1396.0));
+        assert_eq!(secured_maturities.map(|metric| metric.numeric_value.amount), Some(1590.0));
+    }
+
+    #[test]
+    fn extracts_other_borrowed_funds_from_short_term_unsecured_balance_table() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Short-term unsecured funding</caption>
+                  <tr>
+                    <th>(in millions)</th>
+                    <th>2024</th>
+                    <th>2023</th>
+                  </tr>
+                  <tr>
+                    <th>Other borrowed funds</th>
+                    <td>8789</td>
+                    <td>10727</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        let other_borrowed_funds = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_other_borrowed_funds"
+        });
+
+        assert_eq!(other_borrowed_funds.map(|metric| metric.numeric_value.amount), Some(8789.0));
     }
 
     #[test]
