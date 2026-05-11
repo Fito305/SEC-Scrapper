@@ -368,6 +368,7 @@ fn normalize_numeric_metric(
     promote_segment_inline_xbrl_aggregate_totals(&candidates.metric_id, &mut candidates.html);
     prefer_same_accession_notes_and_bonds_total(&candidates.metric_id, &mut candidates.html);
     prefer_same_accession_debt_detail_total(&candidates.metric_id, &mut candidates.html);
+    prefer_same_accession_other_borrowed_funds_primary(&candidates.metric_id, &mut candidates.html);
     prune_metric_specific_history_duplicates(&candidates.metric_id, &mut candidates.html);
     collapse_same_accession_duplicates(candidates.domain, &mut candidates.xbrl);
     collapse_same_accession_duplicates(candidates.domain, &mut candidates.html);
@@ -642,6 +643,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_same_accession_other_borrowed_funds_duplicate_issue(metric_id, values) {
+        return true;
+    }
+
     let supports_history_suppression =
         metric_id.starts_with("segment_data.") || metric_id == "debt_and_credit.notes_and_bonds";
     if !supports_history_suppression {
@@ -806,6 +811,23 @@ fn suppress_same_accession_debt_detail_total_duplicate_issue(
     })
 }
 
+fn suppress_same_accession_other_borrowed_funds_duplicate_issue(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if metric_id != "debt_and_credit.detail_other_borrowed_funds" || values.len() != 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+
+    values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+}
+
 fn suppress_segment_inline_xbrl_component_duplicate_issue(
     metric_id: &str,
     values: &[NumericValue],
@@ -921,6 +943,27 @@ fn prefer_same_accession_debt_detail_total(metric_id: &str, values: &mut [Numeri
 
         right_total.cmp(&left_total).then_with(|| right.amount.total_cmp(&left.amount))
     });
+}
+
+fn prefer_same_accession_other_borrowed_funds_primary(
+    metric_id: &str,
+    values: &mut [NumericValue],
+) {
+    if metric_id != "debt_and_credit.detail_other_borrowed_funds" || values.len() != 2 {
+        return;
+    }
+
+    let Some(first) = values.first() else {
+        return;
+    };
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return;
+    }
+
+    values.sort_by(|left, right| right.amount.total_cmp(&left.amount));
 }
 
 fn segment_inline_xbrl_representative_values(values: &[NumericValue]) -> Vec<NumericValue> {
@@ -2368,6 +2411,51 @@ mod tests {
         assert!(
             normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
             "same-accession debt-detail total/component rows should stay reviewable in provenance without main warning noise"
+        );
+    }
+
+    #[test]
+    fn other_borrowed_funds_same_accession_pair_stays_in_provenance_without_main_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut larger = sample_numeric_value(SourceType::Html, 30_428.0);
+        larger.label = Some("Other borrowed funds".to_string());
+        larger.provenance.filing_label = Some("Other borrowed funds".to_string());
+        larger.provenance.source_location.row_label = Some("Other borrowed funds".to_string());
+        larger.provenance.accession_number = "0000019617-19-000054".to_string();
+
+        let mut smaller = larger.clone();
+        smaller.amount = 8_789.0;
+        smaller.provenance.source_location.row_label = Some("Other borrowed funds".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.detail_other_borrowed_funds"),
+                    metric_name: "Other Borrowed Funds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_detail".to_string()),
+                    numeric_value: larger,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("debt_and_credit.detail_other_borrowed_funds"),
+                    metric_name: "Other Borrowed Funds".to_string(),
+                    domain: DomainName::DebtAndCredit,
+                    subdomain: Some("funding_detail".to_string()),
+                    numeric_value: smaller,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 30_428.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "same-accession other-borrowed-funds pairs should remain reviewable in provenance without main warning noise"
         );
     }
 

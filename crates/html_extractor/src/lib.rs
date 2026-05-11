@@ -180,7 +180,6 @@ impl HtmlExtractor {
             ));
             extracted.extend(self.extract_funding_balance_table_metrics(
                 &structured_rows,
-                &header_cells,
                 filing,
                 &provenance_context,
                 table_scale,
@@ -1068,13 +1067,22 @@ impl HtmlExtractor {
     fn extract_funding_balance_table_metrics(
         &self,
         rows: &[Vec<HtmlTableCell>],
-        header_cells: &[String],
         filing: &FilingMetadata,
         provenance_context: &str,
         table_scale: ValueScale,
     ) -> Vec<ExtractedHtmlMetricValue> {
         let normalized_context = normalize_label(provenance_context);
-        if !normalized_context.contains("short term unsecured funding") {
+        let has_short_term_unsecured_total_row = rows.iter().any(|row| {
+            row.first()
+                .map(|cell| {
+                    normalize_label(&cell.text).contains("total short term unsecured funding")
+                })
+                .unwrap_or(false)
+        });
+        if !normalized_context.contains("short term unsecured funding")
+            && !normalized_context.contains("short term and other borrowed funds")
+            && !has_short_term_unsecured_total_row
+        {
             return Vec::new();
         }
 
@@ -1098,7 +1106,8 @@ impl HtmlExtractor {
                 continue;
             }
 
-            let Some(numeric_text) = select_numeric_cell_for_filing(&cells, header_cells, filing)
+            let Some(numeric_text) =
+                cells.iter().skip(1).find(|cell| parse_numeric_cell(cell).is_some()).cloned()
             else {
                 continue;
             };
@@ -4098,6 +4107,59 @@ mod tests {
                     <th>Other borrowed funds</th>
                     <td>8789</td>
                     <td>10727</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+        "#;
+
+        let extracted = extractor
+            .extract_numeric_fallbacks(html, &filing)
+            .expect("html fallback extraction should succeed");
+
+        let other_borrowed_funds = extracted.iter().find(|metric| {
+            metric.metric_id.as_str() == "debt_and_credit.detail_other_borrowed_funds"
+        });
+
+        assert_eq!(other_borrowed_funds.map(|metric| metric.numeric_value.amount), Some(8789.0));
+    }
+
+    #[test]
+    fn extracts_other_borrowed_funds_from_sources_of_funds_table_family() {
+        let extractor = HtmlExtractor::default();
+        let filing = sample_filing();
+        let html = r#"
+            <html>
+              <body>
+                <table>
+                  <caption>Sources of funds (excluding deposits)</caption>
+                  <tr>
+                    <th>As of or for the year ended December 31,</th>
+                    <th>2018</th>
+                    <th>2017</th>
+                    <th>Average 2018</th>
+                    <th>Average 2017</th>
+                  </tr>
+                  <tr>
+                    <th>Commercial paper</th>
+                    <td>30059</td>
+                    <td>24186</td>
+                    <td>27834</td>
+                    <td>19920</td>
+                  </tr>
+                  <tr>
+                    <th>Other borrowed funds</th>
+                    <td>8789</td>
+                    <td>10727</td>
+                    <td>11369</td>
+                    <td>10755</td>
+                  </tr>
+                  <tr>
+                    <th>Total short-term unsecured funding</th>
+                    <td>38848</td>
+                    <td>34913</td>
+                    <td>39203</td>
+                    <td>30675</td>
                   </tr>
                 </table>
               </body>
