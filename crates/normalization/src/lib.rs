@@ -367,6 +367,7 @@ fn normalize_numeric_metric(
     rank_source_values(&candidates.metric_id, &mut candidates.html);
     promote_segment_inline_xbrl_aggregate_totals(&candidates.metric_id, &mut candidates.html);
     prefer_same_accession_notes_and_bonds_total(&candidates.metric_id, &mut candidates.html);
+    prefer_same_accession_long_term_debt_total(&candidates.metric_id, &mut candidates.html);
     prefer_same_accession_debt_detail_total(&candidates.metric_id, &mut candidates.html);
     prefer_same_accession_other_borrowed_funds_primary(&candidates.metric_id, &mut candidates.html);
     prune_metric_specific_history_duplicates(&candidates.metric_id, &mut candidates.html);
@@ -627,6 +628,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_repeated_long_term_debt_history(metric_id, values) {
+        return true;
+    }
+
     if suppress_same_accession_revenue_inline_xbrl_pair(metric_id, values) {
         return true;
     }
@@ -639,6 +644,10 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
+    if suppress_same_accession_long_term_debt_duplicate_issue(metric_id, values) {
+        return true;
+    }
+
     if suppress_same_accession_debt_detail_total_duplicate_issue(metric_id, values) {
         return true;
     }
@@ -647,8 +656,9 @@ fn suppress_history_duplicate_issue(metric_id: &str, values: &[NumericValue]) ->
         return true;
     }
 
-    let supports_history_suppression =
-        metric_id.starts_with("segment_data.") || metric_id == "debt_and_credit.notes_and_bonds";
+    let supports_history_suppression = metric_id.starts_with("segment_data.")
+        || metric_id == "debt_and_credit.notes_and_bonds"
+        || metric_id == "balance_sheet.long_term_debt";
     if !supports_history_suppression {
         return false;
     }
@@ -716,6 +726,29 @@ fn suppress_repeated_segment_value_sets_across_filings(
     patterns.len() == 1
 }
 
+fn suppress_repeated_long_term_debt_history(metric_id: &str, values: &[NumericValue]) -> bool {
+    if metric_id != "balance_sheet.long_term_debt" || values.len() < 3 {
+        return false;
+    }
+
+    let mut by_amount: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for value in values {
+        *by_amount.entry(format!("{:.6}", value.amount)).or_insert(0) += 1;
+    }
+
+    let repeated_amount_count = by_amount.values().copied().max().unwrap_or(0);
+    if repeated_amount_count < 3 {
+        return false;
+    }
+
+    let repeated_value_total =
+        by_amount.values().copied().filter(|count| *count == repeated_amount_count).sum::<usize>();
+
+    repeated_value_total == values.len()
+        || (repeated_value_total + 1 == values.len() && values.len() >= 4)
+}
+
 fn suppress_same_accession_revenue_inline_xbrl_pair(
     metric_id: &str,
     values: &[NumericValue],
@@ -777,6 +810,40 @@ fn suppress_same_accession_notes_and_bonds_duplicate_issue(
     values
         .iter()
         .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+}
+
+fn suppress_same_accession_long_term_debt_duplicate_issue(
+    metric_id: &str,
+    values: &[NumericValue],
+) -> bool {
+    if metric_id != "balance_sheet.long_term_debt" || values.len() < 2 {
+        return false;
+    }
+
+    let Some(first) = values.first() else {
+        return false;
+    };
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return false;
+    }
+
+    let mut amounts = values.iter().map(|value| value.amount.abs()).collect::<Vec<_>>();
+    amounts.sort_by(|left, right| right.total_cmp(left));
+
+    let largest = amounts[0];
+    let second = amounts[1];
+    if second == 0.0 {
+        return true;
+    }
+
+    let ratio = largest / second;
+    let close_cluster = ratio <= 1.02;
+    let dominant_total = largest >= 250_000.0 && ratio >= 1.10;
+
+    close_cluster || dominant_total
 }
 
 fn suppress_same_accession_debt_detail_total_duplicate_issue(
@@ -891,6 +958,37 @@ fn prefer_same_accession_notes_and_bonds_total(metric_id: &str, values: &mut [Nu
             return history_rank(metric_id, left).cmp(&history_rank(metric_id, right));
         }
 
+        right
+            .amount
+            .abs()
+            .total_cmp(&left.amount.abs())
+            .then_with(|| history_rank(metric_id, left).cmp(&history_rank(metric_id, right)))
+            .then_with(|| {
+                left.provenance
+                    .filing_label
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.provenance.filing_label.as_deref().unwrap_or_default())
+            })
+    });
+}
+
+fn prefer_same_accession_long_term_debt_total(metric_id: &str, values: &mut [NumericValue]) {
+    if metric_id != "balance_sheet.long_term_debt" || values.len() < 2 {
+        return;
+    }
+
+    let Some(first) = values.first() else {
+        return;
+    };
+    if !values
+        .iter()
+        .all(|value| value.provenance.accession_number == first.provenance.accession_number)
+    {
+        return;
+    }
+
+    values.sort_by(|left, right| {
         right
             .amount
             .abs()
@@ -1121,7 +1219,8 @@ fn history_rank(metric_id: &str, value: &NumericValue) -> (i32, String) {
         return segment_history_rank(metric_id, value);
     }
 
-    if metric_id == "debt_and_credit.notes_and_bonds" {
+    if metric_id == "debt_and_credit.notes_and_bonds" || metric_id == "balance_sheet.long_term_debt"
+    {
         let reporting_year = match value.reporting_period.context {
             filing_models::PeriodContext::Instant { as_of } => as_of.year(),
             filing_models::PeriodContext::Duration { end, .. } => end.year(),
@@ -1292,14 +1391,32 @@ fn long_term_debt_rank(value: &NumericValue) -> u8 {
         || context_contains(value, "balance sheet")
     {
         1
+    } else if is_long_term_debt_non_balance_context(value) {
+        4
+    } else if context_contains(value, "average balance sheets")
+        || context_contains(value, "interest and rates")
+        || context_contains(value, "interest income")
+    {
+        5
     } else if context_contains(value, "assets and liabilities measured at fair value")
         || context_contains(value, "fair value hierarchy")
         || context_contains(value, "derivative netting adjustments")
     {
-        5
+        6
     } else {
         3
     }
+}
+
+fn is_long_term_debt_non_balance_context(value: &NumericValue) -> bool {
+    context_contains(value, "three months ended")
+        || context_contains(value, "six months ended")
+        || context_contains(value, "nine months ended")
+        || context_contains(value, "table continued on next page")
+        || context_contains(value, "1q")
+        || context_contains(value, "2q")
+        || context_contains(value, "3q")
+        || context_contains(value, "4q")
 }
 
 fn prune_context_mismatches(metric_id: &str, values: &mut Vec<NumericValue>) {
@@ -1307,11 +1424,29 @@ fn prune_context_mismatches(metric_id: &str, values: &mut Vec<NumericValue>) {
         values.retain(|value| !context_contains(value, "percent of net sales"));
         prune_cost_of_goods_sold_context_mismatches(values);
     } else if metric_id == "balance_sheet.long_term_debt" {
+        let has_primary_debt_balance_candidate = values.iter().any(|value| {
+            !is_long_term_debt_non_balance_context(value)
+                && !context_contains(value, "average balance sheets")
+                && !context_contains(value, "interest and rates")
+                && !context_contains(value, "interest income")
+                && !context_contains(value, "assets and liabilities measured at fair value")
+                && !context_contains(value, "fair value hierarchy")
+                && !context_contains(value, "derivative netting adjustments")
+        });
         let has_non_fair_value_candidate = values.iter().any(|value| {
             !context_contains(value, "assets and liabilities measured at fair value")
                 && !context_contains(value, "fair value hierarchy")
                 && !context_contains(value, "derivative netting adjustments")
         });
+
+        if has_primary_debt_balance_candidate {
+            values.retain(|value| {
+                !(context_contains(value, "average balance sheets")
+                    || context_contains(value, "interest and rates")
+                    || context_contains(value, "interest income")
+                    || is_long_term_debt_non_balance_context(value))
+            });
+        }
 
         if has_non_fair_value_candidate {
             values.retain(|value| {
@@ -2804,6 +2939,125 @@ mod tests {
     }
 
     #[test]
+    fn long_term_debt_prunes_average_balance_sheet_noise_when_balance_sheet_exists() {
+        let normalizer = Normalizer::new();
+
+        let mut average_balance_value = sample_numeric_value(SourceType::Html, 1589.0);
+        average_balance_value.label = Some("Long-term debt".to_string());
+        average_balance_value.provenance.filing_label = Some(
+            "JPMorgan Chase & Co. Consolidated average balance sheets, interest and rates (unaudited)"
+                .to_string(),
+        );
+        average_balance_value.provenance.source_location.section_name = Some(
+            "JPMorgan Chase & Co. Consolidated average balance sheets, interest and rates (unaudited)"
+                .to_string(),
+        );
+        average_balance_value.provenance.source_location.table_name = Some(
+            "JPMorgan Chase & Co. Consolidated average balance sheets, interest and rates (unaudited)"
+                .to_string(),
+        );
+        average_balance_value.provenance.source_location.row_label =
+            Some("Long-term debt".to_string());
+
+        let mut balance_sheet_value = sample_numeric_value(SourceType::Html, 292224.0);
+        balance_sheet_value.label = Some("Long-term debt".to_string());
+        balance_sheet_value.provenance.filing_label =
+            Some("Selected Consolidated balance sheets data".to_string());
+        balance_sheet_value.provenance.source_location.section_name =
+            Some("Selected Consolidated balance sheets data".to_string());
+        balance_sheet_value.provenance.source_location.table_name =
+            Some("Long-term debt".to_string());
+        balance_sheet_value.provenance.source_location.row_label =
+            Some("Long-term debt".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: average_balance_value,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: balance_sheet_value,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 292224.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 1);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "average balance sheet long-term debt noise should be pruned when a real balance-sheet value exists"
+        );
+    }
+
+    #[test]
+    fn long_term_debt_prunes_duration_heading_noise_when_balance_sheet_exists() {
+        let normalizer = Normalizer::new();
+
+        let mut duration_heading_value = sample_numeric_value(SourceType::Html, 2003.0);
+        duration_heading_value.label = Some("Long-term debt".to_string());
+        duration_heading_value.provenance.filing_label =
+            Some("Three months ended June 30, Six months ended June 30,".to_string());
+        duration_heading_value.provenance.source_location.section_name =
+            Some("Three months ended June 30, Six months ended June 30,".to_string());
+        duration_heading_value.provenance.source_location.table_name =
+            Some("Long-term debt".to_string());
+        duration_heading_value.provenance.source_location.row_label =
+            Some("Long-term debt".to_string());
+
+        let mut balance_sheet_value = sample_numeric_value(SourceType::Html, 275645.0);
+        balance_sheet_value.label = Some("Long-term debt".to_string());
+        balance_sheet_value.provenance.filing_label = Some("JPMorgan Chase & Co.".to_string());
+        balance_sheet_value.provenance.source_location.section_name =
+            Some("JPMorgan Chase & Co.".to_string());
+        balance_sheet_value.provenance.source_location.table_name =
+            Some("Long-term debt".to_string());
+        balance_sheet_value.provenance.source_location.row_label =
+            Some("Long-term debt".to_string());
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: duration_heading_value,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: balance_sheet_value,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 275645.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 1);
+        assert!(
+            normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"),
+            "duration-heading long-term debt noise should be pruned when a real balance-sheet value exists"
+        );
+    }
+
+    #[test]
     fn later_financial_funding_repeats_stay_in_review_without_main_duplicate_warning() {
         let normalizer = Normalizer::new();
 
@@ -2852,6 +3106,155 @@ mod tests {
         let normalized = normalizer.normalize(&[], &html_result);
 
         assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
+    }
+
+    #[test]
+    fn later_long_term_debt_repeats_stay_in_review_without_main_duplicate_warning() {
+        let normalizer = Normalizer::new();
+
+        let mut original = sample_numeric_value_for_year(SourceType::Html, 292224.0, 2017);
+        original.label = Some("Long-term debt".to_string());
+        original.provenance.accession_number = "000001961717000386".to_string();
+        original.provenance.form_type = FilingForm::Form10Q;
+        original.provenance.filing_label =
+            Some("Selected Consolidated balance sheets data".to_string());
+        original.provenance.source_location.section_name =
+            Some("Selected Consolidated balance sheets data".to_string());
+        original.provenance.source_location.table_name = Some("Long-term debt".to_string());
+        original.provenance.source_location.row_label = Some("Long-term debt".to_string());
+        original.reporting_period.context = PeriodContext::Instant { as_of: date!(2017 - 3 - 31) };
+
+        let mut later_repeat = sample_numeric_value_for_year(SourceType::Html, 292224.0, 2018);
+        later_repeat.label = Some("Long-term debt".to_string());
+        later_repeat.provenance.accession_number = "000001961718000267".to_string();
+        later_repeat.provenance.form_type = FilingForm::Form10Q;
+        later_repeat.provenance.filing_label = Some("JPMorgan Chase & Co.".to_string());
+        later_repeat.provenance.source_location.section_name =
+            Some("JPMorgan Chase & Co.".to_string());
+        later_repeat.provenance.source_location.table_name = Some("Long-term debt".to_string());
+        later_repeat.provenance.source_location.row_label = Some("Long-term debt".to_string());
+        later_repeat.reporting_period.context =
+            PeriodContext::Instant { as_of: date!(2017 - 3 - 31) };
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: later_repeat,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: original,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 292224.0);
+        assert_eq!(normalized.numeric_metrics[0].source_values.len(), 2);
+        assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
+    }
+
+    #[test]
+    fn repeated_long_term_debt_history_with_one_artifact_stays_out_of_main_warnings() {
+        let normalizer = Normalizer::new();
+
+        let mut q1_repeat = sample_numeric_value_for_year(SourceType::Html, 284080.0, 2018);
+        q1_repeat.label = Some("Long-term debt".to_string());
+        q1_repeat.provenance.accession_number = "000001961718000092".to_string();
+        q1_repeat.provenance.form_type = FilingForm::Form10Q;
+        q1_repeat.provenance.filing_label =
+            Some("Selected Consolidated balance sheets data (continued)".to_string());
+        q1_repeat.provenance.source_location.section_name =
+            Some("Selected Consolidated balance sheets data (continued)".to_string());
+        q1_repeat.provenance.source_location.table_name =
+            Some("Selected Consolidated balance sheets data (continued)".to_string());
+        q1_repeat.provenance.source_location.row_label = Some("Long-term debt".to_string());
+        q1_repeat.reporting_period.context =
+            PeriodContext::Instant { as_of: date!(2017 - 12 - 31) };
+
+        let mut q2_repeat = q1_repeat.clone();
+        q2_repeat.provenance.accession_number = "000001961718000151".to_string();
+
+        let mut q3_repeat = q1_repeat.clone();
+        q3_repeat.provenance.accession_number = "000001961718000206".to_string();
+
+        let mut year_end_repeat = q1_repeat.clone();
+        year_end_repeat.provenance.accession_number = "000001961719000054".to_string();
+        year_end_repeat.provenance.form_type = FilingForm::Form10K;
+        year_end_repeat.provenance.filing_label =
+            Some("Selected Consolidated balance sheets data".to_string());
+        year_end_repeat.provenance.source_location.section_name =
+            Some("Selected Consolidated balance sheets data".to_string());
+        year_end_repeat.provenance.source_location.table_name =
+            Some("Selected Consolidated balance sheets data".to_string());
+
+        let mut artifact = sample_numeric_value_for_year(SourceType::Html, 6753.0, 2018);
+        artifact.label = Some("Long-term debt".to_string());
+        artifact.provenance.accession_number = "000001961718000057".to_string();
+        artifact.provenance.form_type = FilingForm::Form10K;
+        artifact.provenance.filing_label = Some("(Table continued on next page)".to_string());
+        artifact.provenance.source_location.section_name =
+            Some("(Table continued on next page)".to_string());
+        artifact.provenance.source_location.table_name = Some("Long-term debt".to_string());
+        artifact.provenance.source_location.row_label = Some("Long-term debt".to_string());
+        artifact.reporting_period.context = PeriodContext::Instant { as_of: date!(2017 - 12 - 31) };
+
+        let html_result = HtmlExtractionResult {
+            numeric_fallbacks: vec![
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: q1_repeat,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: q2_repeat,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: q3_repeat,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: year_end_repeat,
+                },
+                ExtractedHtmlMetricValue {
+                    metric_id: MetricId::new("balance_sheet.long_term_debt"),
+                    metric_name: "Long-Term Debt".to_string(),
+                    domain: DomainName::BalanceSheet,
+                    subdomain: Some("liabilities".to_string()),
+                    numeric_value: artifact,
+                },
+            ],
+            narrative_sections: Vec::new(),
+        };
+
+        let normalized = normalizer.normalize(&[], &html_result);
+
+        assert_eq!(normalized.numeric_metrics.len(), 1);
+        assert_eq!(normalized.numeric_metrics[0].value.amount, 284080.0);
         assert!(normalized.issues.iter().all(|issue| issue.code != "duplicate_source_values"));
     }
 
